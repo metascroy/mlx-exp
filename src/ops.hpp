@@ -6,143 +6,198 @@
 #include <vector>
 #include <type_traits>
 #include <utility>
+#include <functional>
+#include <array>
+#include "id.hpp"  // Mid, Cid, Tid=std::variant<Mid,Cid>, I32Id, F32Id, ShapeId, DTypeId
 
-// ----------------------------------------------------------------------------
-// DType identifier shared with the interpreter (no magic ints).
-// ----------------------------------------------------------------------------
-enum class DTypeId : int {
-  f16 = 0,
-  f32 = 1,
-  bf16 = 2,
-  i32 = 3,
-  i64 = 4,
-  u32 = 5,
-  u8  = 6,
-  boolean = 7,
-};
-
-using Tid = uint32_t;
-
-// ----------------------------------------------------------------------------
-// Op codes
-// ----------------------------------------------------------------------------
-enum class OpCode : uint8_t {
-  NOOP = 0,            // default / placeholder
-
-  // Math / linear
-  MATMUL,
-  MATMUL_ADD,
-  RMS_NORM,
-
-  // Attention
-  SDPA,
-  ROPE_APPLY,
-
-  // Elementwise
-  ADD, MUL, SILU,
-
-  // Shapes
-  RESHAPE, TRANSPOSE, CONTIGUOUS,
-
-  // Indexing / cache
-  GATHER, SLICE, CONCAT,
-
-  // Dtype / const
-  CAST, FULL, ZEROS, ONES,
-
-  // Sampling
-  ARGMAX,
-};
-
-// ----------------------------------------------------------------------------
-// Per-op payloads
-// ----------------------------------------------------------------------------
-
-struct NoopNode { };  // placeholder / default payload
+// -----------------------------------------------------------------------------
+// Per-op payloads (schemas)
+// -----------------------------------------------------------------------------
+struct NoopNode { };
 
 struct MatmulNode {
-  Tid a{}, b{}, out{};
+  Tid a{}, b{};
+  Mid out{};
   bool ta{false}, tb{false};
   std::optional<Tid> bias{};
 };
 
 struct RMSNormNode {
-  Tid x{}, weight{}, out{};
+  Tid x{}, weight{};
+  Mid out{};
   float eps{1e-5f};
 };
 
 struct RopeNode {
-  Tid q_in{}, k_in{}, cos_tbl{}, sin_tbl{};
-  Tid q_out{}, k_out{};
-  int head_dim{};
-  int pos_offset{0};
+  // inputs
+  Tid q_in{}, k_in{};
+
+  // optional precomputed frequency spectrum (a.k.a. inv_freq). If absent, kernel derives from base/dims.
+  std::optional<Tid> freq{std::nullopt};
+
+  // outputs
+  Mid q_out{}, k_out{};
+
+  // params
+  int  head_dim{};
+  bool traditional{false};
+  std::optional<float> base{500000.f};
+  float scale{1.0f};
+
+  I32Id pos{}; // runtime offset/cursor
 };
 
 struct SdpaNode {
-  Tid q{}, k{}, v{}, out{};
+  Tid q{}, k{}, v{};
+  Mid out{};
   float scale{1.0f};
-  std::optional<Tid> mask{};
+  std::optional<Tid> mask{};  // optional additive or boolean mask
+  bool causal{false};         // NEW: pass "causal" string mask to MLX if true and no tensor mask is provided
 };
 
-struct AddNode    { Tid a{}, b{}, out{}; };
-struct MulNode    { Tid a{}, b{}, out{}; };
-struct SiluNode   { Tid x{}, out{}; };
+struct AddNode  { Tid a{}, b{}; Mid out{}; };
+struct MulNode  { Tid a{}, b{}; Mid out{}; };
+struct SiluNode { Tid x{};      Mid out{}; };
 
-struct ReshapeNode   { Tid x{}, out{}; std::vector<int> shape; };
-struct TransposeNode { Tid x{}, out{}; std::vector<int> perm;  };
-struct ContigNode    { Tid x{}, out{}; };
+struct ReshapeNode   { Tid x{}; Mid out{}; std::vector<int> shape; };
+struct TransposeNode { Tid x{}; Mid out{}; std::vector<int> perm;  };
+struct ContigNode    { Tid x{}; Mid out{}; };
 
-struct GatherNode { Tid table{}, ids{}, out{}; };
-struct SliceNode  {
-  Tid x{}, out{};
-  int axis{}, start{}, end{};
+struct GatherNode { Tid table{}, ids{}; Mid out{}; };
 
+struct SliceNode {
+  Tid x{};
+  Mid out{};
+  ShapeId start{};
+  ShapeId stop{};                    // -1 => to end of that dim (handled at runtime)
+  std::optional<ShapeId> strides{};  // nullopt => contiguous (all 1s)
 };
-struct ConcatNode { Tid a{}, b{}, out{}; int axis{}; };
 
-struct CastNode   { Tid x{}, out{}; DTypeId dtype{DTypeId::f16}; };
-struct FullNode   { Tid out{}; std::vector<int> shape; float v{}; DTypeId dtype{DTypeId::f16}; };
-struct ZerosNode  { Tid out{}; std::vector<int> shape;            DTypeId dtype{DTypeId::f16}; };
-struct OnesNode   { Tid out{};  std::vector<int> shape;           DTypeId dtype{DTypeId::f16}; };
+struct ConcatNode { Tid a{}, b{}; Mid out{}; int axis{}; };
 
-struct ArgmaxNode { Tid x{}, out{}; int axis{}; };
+struct CastNode  { Tid x{};  Mid out{}; DTypeId dtype{DTypeId::f16}; };
+struct FullNode  {            Mid out{}; std::vector<int> shape; float v{}; DTypeId dtype{DTypeId::f16}; };
+struct ZerosNode {            Mid out{}; std::vector<int> shape;            DTypeId dtype{DTypeId::f16}; };
+struct OnesNode  {            Mid out{}; std::vector<int> shape;            DTypeId dtype{DTypeId::f16}; };
 
-// ----------------------------------------------------------------------------
-// Variant payload + thin instruction wrapper
-// ----------------------------------------------------------------------------
+struct ArgmaxNode { Tid x{}; Mid out{}; int axis{}; };
 
+struct SliceUpdateNode {
+  Mid dst{};
+  Tid update{};
+  ShapeId start{};
+  ShapeId stop{};                     // -1 => infer = start + update.shape()
+  std::optional<ShapeId> strides{};   // nullopt / all 1s => contiguous
+};
+
+// -----------------------------------------------------------------------------
+// X-macro master list: single source of truth (NAME, PAYLOAD_TYPE)
+// -----------------------------------------------------------------------------
+#ifndef LLM_OP_LIST
+#define LLM_OP_LIST(X)                      \
+  X(NOOP,          NoopNode)                \
+  /* Math / linear */                       \
+  X(MATMUL,        MatmulNode)              \
+  X(RMS_NORM,      RMSNormNode)             \
+  /* Attention */                           \
+  X(SDPA,          SdpaNode)                \
+  X(ROPE_APPLY,    RopeNode)                \
+  /* Elementwise */                         \
+  X(ADD,           AddNode)                 \
+  X(MUL,           MulNode)                 \
+  X(SILU,          SiluNode)                \
+  /* Shapes */                              \
+  X(RESHAPE,       ReshapeNode)             \
+  X(TRANSPOSE,     TransposeNode)           \
+  X(CONTIGUOUS,    ContigNode)              \
+  /* Indexing / cache */                    \
+  X(GATHER,        GatherNode)              \
+  X(SLICE,         SliceNode)               \
+  X(CONCAT,        ConcatNode)              \
+  /* Dtype / const */                       \
+  X(CAST,          CastNode)                \
+  X(FULL,          FullNode)                \
+  X(ZEROS,         ZerosNode)               \
+  X(ONES,          OnesNode)                \
+  /* Sampling */                            \
+  X(ARGMAX,        ArgmaxNode)              \
+  /* In-place */                            \
+  X(SLICE_UPDATE,  SliceUpdateNode)
+#endif
+
+// -----------------------------------------------------------------------------
+// OpCode enum (contiguous) + sentinel
+// -----------------------------------------------------------------------------
+enum class OpCode : uint8_t {
+#define DEFINE_ENUM(NAME, PAYLOAD) NAME,
+  LLM_OP_LIST(DEFINE_ENUM)
+#undef DEFINE_ENUM
+  SENTINEL
+};
+
+// -----------------------------------------------------------------------------
+// Traits: OpCode -> Payload type
+// -----------------------------------------------------------------------------
+template <OpCode> struct OpPayload;
+#define DEFINE_TRAIT(NAME, PAYLOAD) \
+  template <> struct OpPayload<OpCode::NAME> { using type = PAYLOAD; };
+LLM_OP_LIST(DEFINE_TRAIT)
+#undef DEFINE_TRAIT
+
+template <OpCode OC>
+using OpPayloadT = typename OpPayload<OC>::type;
+
+// -----------------------------------------------------------------------------
+// NodeVariant (allows duplicate payload types; use index-based emplace)
+// -----------------------------------------------------------------------------
 using NodeVariant = std::variant<
-  NoopNode,
-  MatmulNode,
-  RMSNormNode,
-  RopeNode,
-  SdpaNode,
-  AddNode,
-  MulNode,
-  SiluNode,
-  ReshapeNode,
-  TransposeNode,
-  ContigNode,
-  GatherNode,
-  SliceNode,
-  ConcatNode,
-  CastNode,
-  FullNode,
-  ZerosNode,
-  OnesNode,
-  ArgmaxNode
+#define VAR_ALT(NAME, PAYLOAD) PAYLOAD,
+  LLM_OP_LIST(VAR_ALT)
+#undef VAR_ALT
+  std::monostate
 >;
 
+// Generate stable indices for each opcode’s alternative in NodeVariant
+enum : size_t {
+#define ENUM_IDX(NAME, PAYLOAD) VAR_IDX_##NAME,
+  LLM_OP_LIST(ENUM_IDX)
+#undef ENUM_IDX
+  VAR_IDX_SENTINEL
+};
+
+template <OpCode> struct OpVariantIndex;
+#define DEFINE_INDEX_TRAIT(NAME, PAYLOAD) \
+  template <> struct OpVariantIndex<OpCode::NAME> { static constexpr size_t value = VAR_IDX_##NAME; };
+LLM_OP_LIST(DEFINE_INDEX_TRAIT)
+#undef DEFINE_INDEX_TRAIT
+
+static_assert(std::variant_size<NodeVariant>::value >= VAR_IDX_SENTINEL,
+              "NodeVariant must have at least as many alts as ops");
+
+// Optional: names for debug/logging
+static constexpr const char* kOpName[static_cast<size_t>(OpCode::SENTINEL)] = {
+#define NAME_ROW(NAME, PAYLOAD) #NAME,
+  LLM_OP_LIST(NAME_ROW)
+#undef NAME_ROW
+};
+
+// -----------------------------------------------------------------------------
+// Instruction (compile-time factory uses index-based emplace to disambiguate)
+// -----------------------------------------------------------------------------
 struct Instr {
   OpCode      op{OpCode::NOOP};
-  NodeVariant node{NoopNode{}}; // safe default
+  NodeVariant node{NoopNode{}};
 
   Instr() = default;
 
-  template <class T,
-            class = std::enable_if_t<!std::is_same_v<std::decay_t<T>, Instr>>>
-  Instr(OpCode opcode, T&& payload)
-  : op(opcode), node(std::forward<T>(payload)) {}
+  template <OpCode OC>
+  static Instr make(OpPayloadT<OC> payload) {
+    Instr i;
+    i.op = OC;
+    // Emplace by index so duplicate types (e.g., MatmulNode) are unambiguous
+    i.node.template emplace<OpVariantIndex<OC>::value>(std::move(payload));
+    return i;
+  }
 
   template <class T>       T& get()       { return std::get<T>(node); }
   template <class T> const T& get() const { return std::get<T>(node); }
@@ -151,31 +206,21 @@ struct Instr {
   template <class F> decltype(auto) visit(F&& f) const { return std::visit(std::forward<F>(f), node); }
 };
 
-// ----------------------------------------------------------------------------
-// Small convenience factories
-// ----------------------------------------------------------------------------
-inline Instr make_noop()                   { return Instr{OpCode::NOOP,       NoopNode{}}; }
-inline Instr make_matmul(MatmulNode n)     { return Instr{OpCode::MATMUL,     std::move(n)}; }
-inline Instr make_matmul_add(MatmulNode n) { return Instr{OpCode::MATMUL_ADD, std::move(n)}; }
-inline Instr make_rmsnorm(RMSNormNode n)   { return Instr{OpCode::RMS_NORM,   std::move(n)}; }
-inline Instr make_sdpa(SdpaNode n)         { return Instr{OpCode::SDPA,       std::move(n)}; }
-inline Instr make_rope(RopeNode n)         { return Instr{OpCode::ROPE_APPLY, std::move(n)}; }
+// Sanity: OpCode::COUNT matches LLM_OP_LIST item count
+static_assert(static_cast<size_t>(OpCode::SENTINEL) == ([]{
+  size_t n = 0;
+#define COUNT_ONE(NAME, PAYLOAD) ++n;
+  LLM_OP_LIST(COUNT_ONE)
+#undef COUNT_ONE
+  return n;
+})(), "OpCode::COUNT mismatch with LLM_OP_LIST");
 
-inline Instr make_add(AddNode n)           { return Instr{OpCode::ADD,        std::move(n)}; }
-inline Instr make_mul(MulNode n)           { return Instr{OpCode::MUL,        std::move(n)}; }
-inline Instr make_silu(SiluNode n)         { return Instr{OpCode::SILU,       std::move(n)}; }
-
-inline Instr make_reshape(ReshapeNode n)   { return Instr{OpCode::RESHAPE,    std::move(n)}; }
-inline Instr make_transpose(TransposeNode n){return Instr{OpCode::TRANSPOSE,  std::move(n)}; }
-inline Instr make_contig(ContigNode n)     { return Instr{OpCode::CONTIGUOUS, std::move(n)}; }
-
-inline Instr make_gather(GatherNode n)     { return Instr{OpCode::GATHER,     std::move(n)}; }
-inline Instr make_slice(SliceNode n)       { return Instr{OpCode::SLICE,      std::move(n)}; }
-inline Instr make_concat(ConcatNode n)     { return Instr{OpCode::CONCAT,     std::move(n)}; }
-
-inline Instr make_cast(CastNode n)         { return Instr{OpCode::CAST,       std::move(n)}; }
-inline Instr make_full(FullNode n)         { return Instr{OpCode::FULL,       std::move(n)}; }
-inline Instr make_zeros(ZerosNode n)       { return Instr{OpCode::ZEROS,      std::move(n)}; }
-inline Instr make_ones(OnesNode n)         { return Instr{OpCode::ONES,       std::move(n)}; }
-
-inline Instr make_argmax(ArgmaxNode n)     { return Instr{OpCode::ARGMAX,     std::move(n)}; }
+// -----------------------------------------------------------------------------
+// Auto-generated convenience factories (no drift — built from LLM_OP_LIST)
+// -----------------------------------------------------------------------------
+#define DEFINE_MAKE_FN(NAME, PAYLOAD) \
+  inline Instr make_##NAME(PAYLOAD n) { \
+    return Instr::make<OpCode::NAME>(std::move(n)); \
+  }
+LLM_OP_LIST(DEFINE_MAKE_FN)
+#undef DEFINE_MAKE_FN

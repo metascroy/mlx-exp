@@ -1,175 +1,224 @@
 // main.cpp
-#include "interpreter.hpp"
+#include "id.hpp"
 #include "ops.hpp"
-#include "graph_build.hpp"
+#include "program.hpp"
+#include "interpreter.hpp"
+#include "llm_builder.hpp"
 
 #include <iostream>
-#include <random>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <chrono>
+#include <iomanip>
+#include <string>
+#include <cstdlib>
+#include <stdexcept>
+#include <algorithm>
 
-// Small helper to fill an MLX array with deterministic values.
-static void fill_uniform(mlx::core::array& a,
-                         float lo = -0.02f,
-                         float hi = 0.02f,
-                         uint32_t seed = 42) {
-  std::mt19937 rng(seed);
-  std::uniform_real_distribution<float> dist(lo, hi);
+using namespace executorch::mlx;
+using namespace mlx::core;
 
-  // Materialize a host buffer then copy to device (simple & portable).
-  auto shape = a.shape();                 // mlx::core::Shape
-  size_t n = 1;
-  for (int d : shape) n *= static_cast<size_t>(d);
-
-  std::vector<float> host(n);
-  for (size_t i = 0; i < n; ++i) host[i] = dist(rng);
-
-  // Construct an MLX array from host data and reshape to 'shape'
-  auto host_arr = mlx::core::array(host.data(),
-                                   mlx::core::Shape{static_cast<int>(n)},
-                                   mlx::core::float32);
-  host_arr = mlx::core::reshape(host_arr, shape);
-  a = mlx::core::astype(host_arr, a.dtype());
+// Helpers
+static std::vector<int> read_token_ids(const std::string& path) {
+  std::ifstream f(path);
+  if (!f) throw std::runtime_error("cannot open tokens file: " + path);
+  std::vector<int> ids; ids.reserve(4096);
+  std::string line;
+  while (std::getline(f, line)) {
+    std::istringstream iss(line);
+    int x; while (iss >> x) ids.push_back(x);
+  }
+  if (ids.empty()) throw std::runtime_error("no token ids found in: " + path);
+  return ids;
 }
 
-int main() {
-  using namespace llm;
+static int env_or_int(const char* name, int def) {
+  const char* v = std::getenv(name);
+  return v ? std::max(0, std::atoi(v)) : def;
+}
 
-  std::cout << "MLX LLM interpreter demo (mini MLP/SwiGLU)\n";
+static std::string env_or(const char* name, const char* def) {
+  const char* v = std::getenv(name);
+  return v ? std::string(v) : std::string(def);
+}
 
-  // ------------------------------------------------------------
-  // 1) Tensor IDs (TIDs) — fixed slots in the tensor table
-  // ------------------------------------------------------------
-  enum : Tid {
-    T_X = 0,      // [B, D]
-    T_W_UP,       // [D, H]
-    T_W_GATE,     // [D, H]
-    T_W_DOWN,     // [H, D]
-    T_UP,         // [B, H]
-    T_GATE,       // [B, H]
-    T_ACT,        // [B, H]
-    T_H,          // [B, H]
-    T_MLP_OUT,    // [B, D]
-    T_Y,          // [B, D]  (residual add back into X)
-    T__COUNT
-  };
+int main(int, char**) {
+  try {
+    // ---------------- Inputs via env ----------------
+    const std::string model_pt  = env_or("MODEL_PT",   "model.pt");
+    const std::string prompt_fp = env_or("PROMPT_IDS", "prompt_ids.txt");
+    const int max_new_tokens    = env_or_int("MAX_NEW_TOKENS", 64);
 
-  // Shape params for a toy example
-  const int B = 2;       // batch
-  const int D = 8;       // model dim
-  const int H = 16;      // hidden dim (MLP expansion)
+    // ---------------- Config (must match checkpoint) ----------------
+    LlamaCfg cfg;
+    cfg.B        = 1;
+    cfg.T_max    = 4096;     // beware KV memory
+    cfg.H        = 32;
+    cfg.H_kv     = 8;        // set to H if no GQA support
+    cfg.D_model  = 2048;
+    cfg.D_head   = 64;
+    cfg.n_layers = 16;
+    cfg.d_ff     = 8192;
+    cfg.vocab    = 128256;
 
-  // ------------------------------------------------------------
-  // 2) Allocate tensor table
-  // ------------------------------------------------------------
-  Interpreter interp;
+    // ---------------- Build graph & state ----------------
+    Program prog;            // shared program (prefill + decode)
+    MutableData st;          // runtime state: inputs, KV tensors, cursor/shapes
 
-  // Create arrays (use interp.set so optionals are engaged)
-  interp.set(T_X,       mlx::core::zeros(mlx::core::Shape{B, D}, mlx::core::float32));
-  interp.set(T_W_UP,    mlx::core::zeros(mlx::core::Shape{D, H}, mlx::core::float32));
-  interp.set(T_W_GATE,  mlx::core::zeros(mlx::core::Shape{D, H}, mlx::core::float32));
-  interp.set(T_W_DOWN,  mlx::core::zeros(mlx::core::Shape{H, D}, mlx::core::float32));
-  interp.set(T_UP,      mlx::core::zeros(mlx::core::Shape{B, H}, mlx::core::float32));
-  interp.set(T_GATE,    mlx::core::zeros(mlx::core::Shape{B, H}, mlx::core::float32));
-  interp.set(T_ACT,     mlx::core::zeros(mlx::core::Shape{B, H}, mlx::core::float32));
-  interp.set(T_H,       mlx::core::zeros(mlx::core::Shape{B, H}, mlx::core::float32));
-  interp.set(T_MLP_OUT, mlx::core::zeros(mlx::core::Shape{B, D}, mlx::core::float32));
-  interp.set(T_Y,       mlx::core::zeros(mlx::core::Shape{B, D}, mlx::core::float32));
+    // Load weights into ConstantData
+    ConstantData cdata;
+    auto W = load_llama_weights_from_torch(model_pt, cdata, cfg, /*tie_lm_head_to_tok_emb=*/true);
 
-  // Initialize inputs & weights (unwrap via interp.at to get array&)
-  fill_uniform(interp.at(T_X),       -0.5f, 0.5f, 123);
-  fill_uniform(interp.at(T_W_UP),    -0.1f, 0.1f,  21);
-  fill_uniform(interp.at(T_W_GATE),  -0.1f, 0.1f,  22);
-  fill_uniform(interp.at(T_W_DOWN),  -0.1f, 0.1f,  23);
+    // KV caches (ids + state)
+    auto C = make_llama_cache_ids(cfg, /*base_mid=*/10000);
+    init_llama_cache_state(st, cfg, C);
 
-  // ------------------------------------------------------------
-  // 3) Build a mini graph: SwiGLU MLP block
-  //
-  //   up   = X @ W_up           // [B, H]
-  //   gate = X @ W_gate         // [B, H]
-  //   act  = silu(gate)         // [B, H]
-  //   h    = up * act           // [B, H]
-  //   mlp  = h @ W_down         // [B, D]
-  //   y    = X + mlp            // [B, D]   (residual)
-  // ------------------------------------------------------------
-  std::vector<Instr> prog;
+    // IO MIDs
+    Mid input_ids{0};
+    Mid logits{1};
 
-  // up = X @ W_up
-  {
-    MatmulNode n{};
-    n.a = T_X; n.b = T_W_UP; n.out = T_UP;
-    n.ta = false; n.tb = false; n.bias = std::nullopt;
-    prog.push_back(make_matmul(std::move(n)));
+    // Build graph
+    auto G = build_llama_shared(prog, cfg, W, C, input_ids, logits);
+    prog.C = std::make_shared<const ConstantData>(std::move(cdata));
+
+    // Quick embedding sanity check
+    {
+      const auto& E = prog.C->c_ref(W.tok_emb);
+      auto Ef = astype(E, float32);
+      auto nfin = sum(astype(isfinite(Ef), float32)); nfin.eval();
+      double total = 1.0; for (int d : E.shape()) total *= d;
+      std::cout << "[sanity] tok_emb finite=" << nfin.item<float>() << " of " << total << "\n";
+      if (nfin.item<float>() < total) throw std::runtime_error("NaNs in tok_emb: bad state_dict import");
+    }
+
+    Interpreter interp;
+
+    // ---------------- Prefill with prompt ----------------
+    std::vector<int> prompt_ids = read_token_ids(prompt_fp);
+    if ((int)prompt_ids.size() > cfg.T_max) {
+      throw std::runtime_error("prompt too long for T_max");
+    }
+
+    // [B, T_prompt] int32
+    const int T_prefill = (int)prompt_ids.size();
+    array ids_arr(prompt_ids.data(), Shape{(int)prompt_ids.size()}, int32);
+    ids_arr = reshape(ids_arr, {cfg.B, T_prefill});
+    st.set_mutable_id(input_ids, std::move(ids_arr));
+
+    // Window [0 : T_prefill] with cursor=0 for RoPE during prefill
+    set_prefill_cursor_shared(st, cfg, C, /*T_written=*/T_prefill);
+
+    std::cout << "Running prefill on T=" << T_prefill << "...\n";
+    auto t0 = std::chrono::steady_clock::now();
+    interp.run(prog, st);
+    mlx::core::synchronize();
+    auto t1 = std::chrono::steady_clock::now();
+    std::cout << std::fixed << std::setprecision(3)
+              << "Prefill time: " << std::chrono::duration<double, std::milli>(t1 - t0).count() << " ms\n";
+
+    // ---------------- Handoff to decode ----------------
+    begin_decode_after_prefill(st, cfg, C, T_prefill);
+
+    // ---------------- Decode (greedy) ----------------
+    std::vector<int> generated; generated.reserve(max_new_tokens);
+
+// Device buffer to collect all generated ids: [B, max_new_tokens] (i32)
+array gen_buf = zeros({cfg.B, max_new_tokens}, int32);
+
+// Optional: ban special/control tokens
+const int ban_from_id = 128000;
+const bool ban_special = true;
+auto mask_special_logits_inplace = [&](array& last_logits /*[B,1,V]*/) {
+  if (!ban_special) return;
+  const auto s = last_logits.shape();  // [B,1,V]
+  const int V = s[2];
+  if (ban_from_id < V) {
+    std::vector<int> idx(V);
+    for (int j = 0; j < V; ++j) idx[j] = (j >= ban_from_id) ? 1 : 0;
+    array mask_v(idx.data(), Shape{V}, int32);
+    mask_v = astype(mask_v, float32);
+    last_logits = add(last_logits, reshape(mask_v, {1,1,V}) * (-1e30f));
   }
-  // gate = X @ W_gate
-  {
-    MatmulNode n{};
-    n.a = T_X; n.b = T_W_GATE; n.out = T_GATE;
-    n.ta = false; n.tb = false; n.bias = std::nullopt;
-    prog.push_back(make_matmul(std::move(n)));
-  }
-  // act = silu(gate)
-  {
-    SiluNode n{};
-    n.x = T_GATE; n.out = T_ACT;
-    prog.push_back(make_silu(std::move(n)));
-  }
-  // h = up * act
-  {
-    MulNode n{};
-    n.a = T_UP; n.b = T_ACT; n.out = T_H;
-    prog.push_back(make_mul(std::move(n)));
-  }
-  // mlp_out = h @ W_down
-  {
-    MatmulNode n{};
-    n.a = T_H; n.b = T_W_DOWN; n.out = T_MLP_OUT;
-    n.ta = false; n.tb = false; n.bias = std::nullopt;
-    prog.push_back(make_matmul(std::move(n)));
-  }
-  // y = X + mlp_out
-  {
-    AddNode n{};
-    n.a = T_X; n.b = T_MLP_OUT; n.out = T_Y;
-    prog.push_back(make_add(std::move(n)));
+};
+
+double compute_ms = 0.0;
+auto t0_all = std::chrono::steady_clock::now();
+
+for (int step = 0; step < max_new_tokens; ++step) {
+  const int cursor = st.i32_ref(C.layer_cache[0].cursor);
+  if (cursor <= 0) throw std::runtime_error("cursor must be > 0 before decode");
+  if (cursor >= cfg.T_max) {
+    std::cerr << "[i] Reached T_max, stopping decode.\n";
+    break;
   }
 
-  llm::BuildOptions opt;
-  opt.force_argmax_i64 = true;
-  opt.force_gather_i32 = true;
-  opt.prebias_matmul   = true;
-  opt.normalize_axes   = true;
-  auto built = llm::build_and_validate(prog, opt);
+  // ---- pick next token on device ----
+  array logits_ref = st.m_ref(logits);                // [B,T,V]
+  auto s = logits_ref.shape();
+  const int B = s[0], Tdim = s[1], V = s[2];
+  const int last_idx = (Tdim == 1) ? 0 : std::max(0, cursor - 1);
+  array last_logits = (Tdim == 1)
+      ? logits_ref
+      : slice(logits_ref, Shape{0, last_idx, 0}, Shape{B, last_idx + 1, V});
 
-  // ------------------------------------------------------------
-  // 4) Run the interpreter
-  // ------------------------------------------------------------
-  interp.run(built.program);
+  mask_special_logits_inplace(last_logits);
 
-  // Force materialization of the result and print a preview
-  auto& Y = interp.at(T_Y);
+  array next_ids = astype(argmax(last_logits, /*axis=*/2), int32); // [B,1]
 
-  // Print shape
-  std::cout << "Output shape: [";
-  auto shp = Y.shape();
-  for (size_t i = 0; i < shp.size(); ++i) {
-    std::cout << shp[i] << (i + 1 < shp.size() ? ", " : "");
+  // ---- write into device buffer at column 'step' ----
+  // gen_buf[:, step:step+1] = next_ids
+  gen_buf = slice_update(gen_buf,
+                         next_ids,
+                         Shape{0, step},    // start
+                         Shape{B, step+1}); // stop
+
+  // ---- feed token and run one decode step ----
+  st.set_mutable_id(input_ids, next_ids);
+
+  // Advance KV cursor/windows by 1 (do NOT sync)
+  advance_decode_cursor_shared(st, cfg, C, cursor, /*t_step=*/1);
+
+  auto t0s = std::chrono::steady_clock::now();
+  interp.run(prog, st);  // if this internally syncs, that limits TPS; we still avoid host copies
+  mlx::core::synchronize();
+  auto t1s = std::chrono::steady_clock::now();
+  compute_ms += std::chrono::duration<double, std::milli>(t1s - t0s).count();
+}
+
+// ---- One final sync + host transfer for the whole sequence ----
+mlx::core::synchronize();
+
+// gen_buf: [B, max_new_tokens] -> squeeze to [max_new_tokens] (B==1), copy once, then read
+array gen_host = copy(reshape(gen_buf, {max_new_tokens}));
+
+generated.resize(max_new_tokens);
+for (int i = 0; i < max_new_tokens; ++i) {
+  // Take [i:i+1] slice -> reshape to scalar -> read item<int>()
+  array s = slice(gen_host, Shape{i}, Shape{i + 1});
+  int v = copy(reshape(s, {})).item<int>();
+  generated[i] = v;
+}
+
+auto t1_all = std::chrono::steady_clock::now();
+double wall_ms = std::chrono::duration<double, std::milli>(t1_all - t0_all).count();
+
+std::cout << "\nGenerated token ids (" << generated.size() << "): ";
+for (size_t i = 0; i < generated.size(); ++i) {
+  if (i) std::cout << ' ';
+  std::cout << generated[i];
+}
+std::cout << "\n";
+
+if (!generated.empty()) {
+  double tps_compute = generated.size() / std::max(compute_ms / 1000.0, 1e-9);
+  double tps_wall    = generated.size() / std::max(wall_ms    / 1000.0, 1e-9);
+  std::cout << "Throughput (compute): " << tps_compute << " tok/s\n";
+  std::cout << "Throughput (wall):    " << tps_wall    << " tok/s\n";
+}
+    return 0;
+  } catch (const std::exception& e) {
+    std::cerr << "FATAL: " << e.what() << "\n";
+    return 1;
   }
-  std::cout << "]\n";
-
-  // Print first row (small preview)
-  // NOTE: Pulling data back to host for demo purposes:
-  //       In real apps, avoid synchronous reads in hot paths.
-  auto Y_flat = mlx::core::reshape(Y, mlx::core::Shape{B * D});
-  std::cout << "Y[0, :]: ";
-  for (int j = 0; j < D; ++j) {
-    // Extract element [0, j] by taking a tiny slice
-    auto idx_row0 = mlx::core::full(mlx::core::Shape{1}, 0, mlx::core::int32);
-    auto idx_colj = mlx::core::full(mlx::core::Shape{1}, j, mlx::core::int32);
-    auto val = mlx::core::take(mlx::core::take(Y, idx_row0, /*axis=*/0), idx_colj, /*axis=*/1);
-    (void)val; // placeholder; replace with scalar extraction if your API exposes it
-    std::cout << "<v" << j << ">=" << val << (j + 1 < D ? ", " : "");
-  }
-  std::cout << "\n";
-
-  std::cout << "Done.\n";
-  return 0;
 }
