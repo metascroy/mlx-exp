@@ -1,5 +1,4 @@
-// main.cpp
-#include "id.hpp"
+// main.cpp — sequential mbuf allocation (fixed KV write/read windows via scalar slice params)
 #include "ops.hpp"
 #include "program.hpp"
 #include "interpreter.hpp"
@@ -9,242 +8,247 @@
 #include <fstream>
 #include <sstream>
 #include <vector>
-#include <array>
-#include <optional>
 #include <chrono>
 #include <iomanip>
 #include <string>
 #include <cstdlib>
 #include <stdexcept>
+#include <optional>
 #include <algorithm>
-#include <cstring> // memcpy
+#include <cmath>
 
-#include <mlx/transforms.h>
+#include <mlx/ops.h>
 #include <mlx/memory.h>
-#include <mlx/ops.h>  // added: default_device(), new_stream(), synchronize(stream)
+#include <mlx/transforms.h>
 
 using namespace executorch::mlx;
 using namespace mlx::core;
 
-// -----------------------------
-// Helpers
-// -----------------------------
+static inline Shape shape(std::initializer_list<int> v) { return Shape(v.begin(), v.end()); }
+
 static std::vector<int> read_token_ids(const std::string& path) {
   std::ifstream f(path);
   if (!f) throw std::runtime_error("cannot open tokens file: " + path);
-  std::vector<int> ids; ids.reserve(4096);
+  std::vector<int> ids; ids.reserve(8192);
   std::string line;
   while (std::getline(f, line)) {
     std::istringstream iss(line);
     int x; while (iss >> x) ids.push_back(x);
   }
-  if (ids.empty()) throw std::runtime_error("no token ids found in: " + path);
+  if (ids.empty()) throw std::runtime_error("no token ids in: " + path);
   return ids;
 }
+static int env_or_int(const char* k, int d){ const char* v=getenv(k); return v? std::max(0,atoi(v)) : d; }
+static std::string env_or(const char* k, const char* d){ const char* v=getenv(k); return v? std::string(v):std::string(d); }
 
-static int env_or_int(const char* name, int def) {
-  const char* v = std::getenv(name);
-  return v ? std::max(0, std::atoi(v)) : def;
-}
-
-static std::string env_or(const char* name, const char* def) {
-  const char* v = std::getenv(name);
-  return v ? std::string(v) : std::string(def);
-}
-
-// -------------------------------------------------------
-// Sampling: argmax over vocab, return [B,1] int32 tokens
-// logits: [B, T, V]  (prefill T>=1, decode T==1 usually)
-// -------------------------------------------------------
-static inline mlx::core::array sample_next_token(const mlx::core::array& logits,
-                                                 bool /*is_prefill*/) {
-  using namespace mlx::core;
+// logits: [B, T, V] -> argmax over last step -> [B, 1] int32
+static array sample_next_token(const array& logits) {
   auto s = logits.shape();
-  if (s.size() != 3) {
-    throw std::runtime_error("sample_next_token: expected logits rank-3 [B,T,V]");
-  }
-  const int B = s[0], T = s[1], V = s[2];
-
-  array last_logits = logits;
-  if (T > 1) {
-    // [B,1,V] slice at last timestep
-    last_logits = slice(logits, Shape{0, T - 1, 0}, Shape{B, T, V});
-  }
-
-  // Argmax over vocab -> [B,1] (int32)
-  array next_ids = astype(argmax(last_logits, /*axis=*/2), int32);
-  return next_ids; // caller controls evaluation/sync
+  if (s.size()!=3) throw std::runtime_error("logits must be [B,T,V]");
+  int B=s[0], T=s[1], V=s[2];
+  array last = (T>1) ? slice(logits, Shape{0,T-1,0}, Shape{B,T,V}) : logits;
+  array idx  = argmax(last, /*axis=*/2);
+  if (idx.dtype()!=int32) idx = astype(idx, int32);
+  return idx; // [B,1]
 }
 
-int main(int, char**) {
+int main() {
   try {
-    // ---------------- Inputs via env ----------------
-    const std::string model_pt   = env_or("MODEL_PT",   "model.pt");
-    const std::string prompt_fp  = env_or("PROMPT_IDS", "prompt_ids.txt");
-    const int max_new_tokens     = env_or_int("MAX_NEW_TOKENS", 64);
-    const int print_batch        = std::max(1, env_or_int("PRINT_BATCH", 1)); // configurable "8"
+    const std::string model_pt  = env_or("MODEL_PT",   "model.pt");
+    const std::string prompt_fp = env_or("PROMPT_IDS", "prompt_ids.txt");
+    const int max_new_tokens    = env_or_int("MAX_NEW_TOKENS", 64);
+    const int print_batch       = std::max(1, env_or_int("PRINT_BATCH", 1));
 
-    // ---------------- Config ----------------
+    set_wired_limit(4L * (1<<30));
+
+    // -------- Config --------
     LlamaCfg cfg;
-    cfg.B        = 1;
-    cfg.T_max    = 4096;
-    cfg.H        = 32;
-    cfg.H_kv     = 8;
-    cfg.D_model  = 2048;
-    cfg.D_head   = 64;
-    cfg.n_layers = 16;
-    cfg.d_ff     = 8192;
-    cfg.vocab    = 128256;
+    cfg.B=1; cfg.T_max=4096;
+    cfg.H=32; cfg.H_kv=8; cfg.D_model=2048; cfg.D_head=64;
+    cfg.n_layers=16; cfg.d_ff=8192; cfg.vocab=128256;
+    cfg.rope_traditional=false; cfg.rope_theta=500000.f; cfg.rms_eps=1e-6f;
 
-    // ---------------- Build graph ----------------
-    Program prog;
-    MutableData st;
-    ConstantData cdata;
-    auto W = load_llama_weights_from_torch(model_pt, cdata, cfg, /*tie_lm_head_to_tok_emb=*/false);
-    auto C = make_llama_cache_ids(cfg, /*base_mid=*/10000);
-    init_llama_cache_state(st, cfg, C);
+    Program P;
 
-    Mid input_ids{0};
-    Mid logits{1};
-    auto G = build_llama_shared(prog, cfg, W, C, input_ids, logits);
-    prog.C = std::make_shared<const ConstantData>(std::move(cdata));
+    // 1) Load constants (bumps P.num_constants only)
+    auto W = load_llama_weights_from_torch(model_pt, P, cfg, /*tie_lm_head=*/true);
 
-    // Sanity check
-    {
-      const auto& E = prog.C->c_ref(W.tok_emb);
-      auto Ef = astype(E, float32);
-      auto nfin = sum(astype(isfinite(Ef), float32)); nfin.eval();
-      double total = 1.0; for (int d : E.shape()) total *= d;
-      std::cout << "[sanity] tok_emb finite=" << nfin.item<float>() << " of " << total << "\n";
-      if (nfin.item<float>() < total) throw std::runtime_error("NaNs in tok_emb: bad state_dict import");
+    // 2) Fix ranges and finalize once (inputs/outputs known; mbufs start empty)
+    P.num_inputs  = 1; // tokens
+    P.num_outputs = 1; // logits
+    P.num_mutable_buffers = 0; // we'll append mbufs sequentially
+    P.num_temps = 0;
+    P.finalize_layout(); // sizes meta & C_tensors (already filled), defines mbufs_begin()
+
+    // 3) Append caches (mbufs) and graph scratch (mbufs)
+    auto Cc = make_caches(P, cfg);       // appends: cursor, scalar slice params, per-layer K/V
+    auto G  = make_graph_ids(P, cfg);    // appends: X_embed, X_stream, per-layer scratch, tail x_next
+
+    // Bind helpful names (optional)
+    P.bind_name(G.input_ids, "input_ids");
+    P.bind_name(G.logits,    "logits");
+    for (int l=0;l<cfg.n_layers;++l) {
+      P.bind_name(Cc.by_layer[l].K_cache, "L"+std::to_string(l)+".K_cache");
+      P.bind_name(Cc.by_layer[l].V_cache, "L"+std::to_string(l)+".V_cache");
     }
 
-    Interpreter interp;
+    // 4) Emit instructions
+    build_llama_shared(P, cfg, W, Cc, G);
 
-    // ---- Create a dedicated stream for generation (added) ----
-    // auto dev        = default_device();
-    // auto gen_stream = new_stream(dev);
+    // -------- Runtime state --------
+    ExecutionState S; S.bind(P);
 
-    // ---------------- Prefill ----------------
-    std::vector<int> prompt_ids = read_token_ids(prompt_fp);
-    if ((int)prompt_ids.size() > cfg.T_max) throw std::runtime_error("prompt too long");
-    const int T_prefill = (int)prompt_ids.size();
+    // Debug layout (optional)
+    std::cout << "constants: " << P.num_constants << "\n";
+    std::cout << "constants begin: " << P.constants_begin() << "\n";
+    std::cout << "inputs: " << P.num_inputs << "\n";
+    std::cout << "inputs begin: " << P.inputs_begin() << "\n";
+    std::cout << "outputs: " << P.num_outputs << "\n";
+    std::cout << "outputs begin: " << P.outputs_begin() << "\n";
+    std::cout << "mutable buffers: " << P.num_mutable_buffers << "\n";
+    std::cout << "mutable buffers begin: " << P.mbufs_begin() << "\n";
+    std::cout << "temps: " << P.num_temps << "\n";
+    std::cout << "temps begin: " << P.temps_begin() << "\n";
 
-    array ids_arr(prompt_ids.data(), Shape{(int)prompt_ids.size()}, int32);
-    ids_arr = reshape(ids_arr, {cfg.B, T_prefill});
-    st.set_mutable_id(input_ids, std::move(ids_arr));
+    // Initialize KV caches + scalar slice helpers
+    {
+      const Dtype act_dt = to_mlx(kComputeDT);
+      for (int l=0;l<cfg.n_layers;++l) {
+        const auto& c = Cc.by_layer[l];
+        S.tensors[c.K_cache.idx] = zeros(shape({cfg.B, cfg.H_kv, cfg.T_max, cfg.D_head}), act_dt);
+        S.tensors[c.V_cache.idx] = zeros(shape({cfg.B, cfg.H_kv, cfg.T_max, cfg.D_head}), act_dt);
+      }
+      const auto& c0 = Cc.by_layer[0];
+      // cursor scalar
+      S.scalars[c0.cursor.idx] = Scalar{int32_t(0)};
+      // slice axis = time dim (2)
+      S.scalars[c0.sh_axis.idx] = Scalar{int32_t(2)};
+      S.scalars[c0.rd_axis.idx] = Scalar{int32_t(2)};
+      // initialize starts/lengths to zero; will set proper values before runs
+      S.scalars[c0.sh_start.idx] = Scalar{int32_t(0)};
+      S.scalars[c0.sh_len.idx]   = Scalar{int32_t(0)};
+      S.scalars[c0.rd_start.idx] = Scalar{int32_t(0)};
+      S.scalars[c0.rd_len.idx]   = Scalar{int32_t(0)};
+    }
 
-    set_prefill_cursor_shared(st, cfg, C, /*T_written=*/T_prefill);
-    std::cout << "Running prefill on T=" << T_prefill << "...\n";
+    // -------- Prefill --------
+    std::cout << "Starting prefill…\n";
+    std::vector<int> prompt = read_token_ids(prompt_fp);
+    if ((int)prompt.size() > cfg.T_max) throw std::runtime_error("prompt too long");
+    const int T_prefill = (int)prompt.size();
 
-    auto t0_prefill = std::chrono::steady_clock::now();
-    interp.run(prog, st); // changed: pass stream
+    // tokens → inputs range
+    {
+      array ids(prompt.data(), Shape{(int)prompt.size()}, int32);
+      ids = reshape(ids, Shape{cfg.B, T_prefill});
+      S.tensors[G.input_ids.idx] = std::move(ids);
+    }
 
-    // Sample next token from prefill logits via argmax
-    array next_ids_prefill = sample_next_token(st.m_ref(logits), /*is_prefill=*/true);
+    // set cursor/slices for prefill: write/read [0, T_prefill)
+    {
+      auto& c0 = Cc.by_layer[0];
+      S.scalars[c0.cursor.idx]   = Scalar{int32_t(0)};
+      S.scalars[c0.sh_start.idx] = Scalar{int32_t(0)};
+      S.scalars[c0.sh_len.idx]   = Scalar{int32_t(T_prefill)};
+      S.scalars[c0.rd_start.idx] = Scalar{int32_t(0)};
+      S.scalars[c0.rd_len.idx]   = Scalar{int32_t(T_prefill)};
+    }
 
-    // ---- Synchronized evaluation at end of prefill ----
-    mlx::core::eval(next_ids_prefill);
+    std::cout << "Defining interpreter…\n";
+    Interpreter I;
 
-    std::cout << "Prefill token: " << next_ids_prefill.item<int>() << "\n";
+    std::cout << "Running prefill on T=" << T_prefill << "…\n";
+    auto t0p = std::chrono::steady_clock::now();
+    I.run(P, S);
+    std::cout << "Done calling I.run()\n";
+    array next_ids = sample_next_token(S.tensor_ref(G.logits));
+    eval(next_ids);
+    auto t1p = std::chrono::steady_clock::now();
+    std::cout << "Prefill token: " << next_ids.item<int>() << "\n";
+    std::cout << "Prefill time: "
+              << std::chrono::duration<double, std::milli>(t1p-t0p).count() << " ms\n";
 
-    auto t1_prefill = std::chrono::steady_clock::now();
-    std::cout << std::fixed << std::setprecision(3)
-              << "Prefill time: "
-              << std::chrono::duration<double, std::milli>(t1_prefill - t0_prefill).count()
-              << " ms\n";
+    // -------- Seed decode slice helpers (write one step at T_prefill) --------
+    {
+      auto& c0 = Cc.by_layer[0];
+      S.scalars[c0.cursor.idx]   = Scalar{int32_t(T_prefill)};
+      // write exactly one new time index at `cursor`
+      S.scalars[c0.sh_start.idx] = Scalar{int32_t(T_prefill)};
+      S.scalars[c0.sh_len.idx]   = Scalar{int32_t(1)};
+      // read covers [0, T_prefill)
+      S.scalars[c0.rd_start.idx] = Scalar{int32_t(0)};
+      S.scalars[c0.rd_len.idx]   = Scalar{int32_t(T_prefill)};
+    }
 
-    // ---------------- Decode (pipelined with batched host sync) ----------------
-    begin_decode_after_prefill(st, cfg, C, T_prefill);
+    // -------- Decode --------
+    array cur_ids = next_ids; // [B,1]
+    int cursor = T_prefill;
+    std::vector<int> printed; printed.reserve(max_new_tokens);
 
-    // Current token to be *printed next iteration*. Async-eval it now.
-    array cur_input_ids = next_ids_prefill;   // [B,1], int32
-    // mlx::core::async_eval(cur_input_ids);     // ensures printed token had async_eval in prior iter
+    auto t0d = std::chrono::steady_clock::now();
+    int batch_count = 0;
+    std::vector<array> pending; pending.reserve(print_batch);
 
-    // Cursor at next write position (== T_prefill). We advance-at-index then ++.
-    int cursor = st.i32_ref(C.layer_cache[0].cursor);
+    for (int step=0; step<max_new_tokens; ++step) {
+      S.tensors[G.input_ids.idx] = cur_ids;
 
-    // Device-ring buffer for tokens to print (optional<> avoids default-ctor)
-    std::vector<std::optional<mlx::core::array>> dev_tok_buf(print_batch);
-    int dev_tok_count = 0;
+      auto& c0 = Cc.by_layer[0];
+      int new_cursor = cursor + 1;
 
-    std::vector<int> generated_host; generated_host.reserve(max_new_tokens);
+      S.scalars[c0.cursor.idx]   = Scalar{int32_t(cursor)};
+      // Write [cursor, cursor+1)
+      S.scalars[c0.sh_start.idx] = Scalar{int32_t(cursor)};
+      S.scalars[c0.sh_len.idx]   = Scalar{int32_t(1)};
+      // Read [0, new_cursor)
+      S.scalars[c0.rd_start.idx] = Scalar{int32_t(0)};
+      S.scalars[c0.rd_len.idx]   = Scalar{int32_t(new_cursor)};
 
-    auto t0_decode = std::chrono::steady_clock::now();
-    int printed = 0;
+      I.run(P, S);
 
-    while (printed < max_new_tokens) {
-      // Feed current token to produce logits for next token.
-      st.set_mutable_id(input_ids, cur_input_ids);
+      array next_ids2 = sample_next_token(S.tensor_ref(G.logits));
+      async_eval(next_ids2);
 
-      // Advance KV cursor for this single step at current index
-      advance_decode_cursor_shared(st, cfg, C, cursor, /*len=*/1);
-      cursor += 1;
+      pending.push_back(next_ids2);
+      ++batch_count;
 
-      // Run one decode step
-      interp.run(prog, st); // changed: pass stream
-
-      // Sample the *next* token from these logits
-      array next_ids = sample_next_token(st.m_ref(logits), /*is_prefill=*/false);
-
-      // Pipeline: async-eval the next token now...
-      mlx::core::async_eval(next_ids);
-
-      // ...then enqueue the *current* token for batched host read/print
-      dev_tok_buf[dev_tok_count++] = std::move(cur_input_ids);
-      ++printed;
-
-      // Flush in batches of print_batch (1-indexed ranges in the label)
-      if (dev_tok_count == print_batch) {
-        std::cout << "[tokens " << (printed - (print_batch - 1)) << "-" << printed << "]: ";
-        for (int i = 0; i < print_batch; ++i) {
-          // Tiny sync per token, but batched instead of every step
-          int tok = dev_tok_buf[i]->item<int>();
+      if (batch_count == print_batch) {
+        std::cout << "[tokens " << (int)printed.size()+1 << "-" << (int)printed.size()+batch_count << "]: ";
+        for (int i=0;i<batch_count;++i) {
+          int t = pending[i].item<int>();
           if (i) std::cout << ' ';
-          std::cout << tok;
-          generated_host.push_back(tok);
-          dev_tok_buf[i].reset();
+          std::cout << t;
+          printed.push_back(t);
         }
         std::cout << "\n";
-        dev_tok_count = 0;
+        pending.clear(); batch_count = 0;
       }
 
-      // Prepare for next iteration: the "next" becomes "current"
-      cur_input_ids = std::move(next_ids);
-
-      // if (printed % 256 == 0) {
-      //   mlx::core::clear_cache();
-      // }
-
-      if (cursor >= cfg.T_max) break; // safety
+      cur_ids = std::move(next_ids2);
+      cursor = new_cursor;
+      if (cursor >= cfg.T_max) break;
     }
 
-    // Flush any remaining tokens (<print_batch tail)
-    if (dev_tok_count > 0) {
-      std::cout << "[tokens " << (printed - dev_tok_count + 1)
-                << "-" << printed << "]: ";
-      for (int i = 0; i < dev_tok_count; ++i) {
-        int tok = dev_tok_buf[i]->item<int>();
+    if (!pending.empty()) {
+      std::cout << "[tokens " << (int)printed.size()+1 << "-" << (int)printed.size()+pending.size() << "]: ";
+      for (size_t i=0;i<pending.size();++i) {
+        int t = pending[i].item<int>();
         if (i) std::cout << ' ';
-        std::cout << tok;
-        generated_host.push_back(tok);
-        dev_tok_buf[i].reset();
+        std::cout << t;
       }
       std::cout << "\n";
-      dev_tok_count = 0;
+      pending.clear();
     }
 
-    // Ensure all outstanding device work is done before timing
-    synchronize(); // changed: sync specific stream
+    synchronize();
+    auto t1d = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double,std::milli>(t1d-t0d).count();
+    double tps = printed.size() / std::max(ms/1000.0, 1e-9);
+    std::cout << "Generated " << printed.size() << " tokens\n";
+    std::cout << "Throughput: " << std::fixed << std::setprecision(2) << tps << " tok/s\n";
 
-    auto t1_decode = std::chrono::steady_clock::now();
-    double ms = std::chrono::duration<double, std::milli>(t1_decode - t0_decode).count();
-    double tps = printed / std::max(ms / 1000.0, 1e-9);
 
-    std::cout << "Generated " << printed << " tokens total\n";
-    std::cout << "Throughput: " << std::fixed << std::setprecision(2)
-              << tps << " tok/s\n";
-
+    std::cout << "Generated tokens: ";
+    for (int t : printed) std::cout << t << ' ';
     return 0;
   } catch (const std::exception& e) {
     std::cerr << "FATAL: " << e.what() << "\n";

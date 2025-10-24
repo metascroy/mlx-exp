@@ -49,7 +49,12 @@ set(MLX_BUILD_TESTS           OFF CACHE BOOL "" FORCE)
 set(MLX_BUILD_EXAMPLES        OFF CACHE BOOL "" FORCE)
 set(MLX_BUILD_BENCHMARKS      OFF CACHE BOOL "" FORCE)
 set(MLX_BUILD_METAL           ON  CACHE BOOL "" FORCE)
-set(MLX_BUILD_CPU             ON  CACHE BOOL "" FORCE)
+set(MLX_BUILD_CPU             OFF CACHE BOOL "" FORCE)
+set(MLX_BUILD_DOCS            OFF CACHE BOOL "" FORCE)
+set(MLX_BUILD_SHARED_LIBS     OFF CACHE BOOL "" FORCE)
+
+
+
 # set(MLX_BUILD_SAFETENSORS   ON  CACHE BOOL "" FORCE)
 
 # ---- If libtorch is in a custom location, set CMAKE_PREFIX_PATH or Torch_DIR before configure ----

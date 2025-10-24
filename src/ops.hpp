@@ -1,43 +1,55 @@
 // ops.hpp
 #pragma once
 #include <cstdint>
+#include <cstddef>
 #include <optional>
 #include <variant>
 #include <vector>
-#include <type_traits>
 #include <utility>
-#include <functional>
-#include <array>
-#include <string>     // ← needed for QLinear4Node::mode / QEmbed4Node::mode
-#include "id.hpp"     // Mid, Cid, Tid=std::variant<Mid,Cid>, I32Id, F32Id, ShapeId, DTypeId
+#include <string>  // for Quantized*::mode
+
+// Unified value identifier. Role is inferred from its index range in Program.
+struct Vid { uint32_t idx{}; };
+
+// DType tag for node attributes (not MLX dtype proper; map in executor)
+enum class DTypeId : int {
+  f16 = 0,
+  f32 = 1,
+  bf16 = 2,
+  i32 = 3,
+  i64 = 4,
+  u32 = 5,
+  u8  = 6,
+  boolean = 7,
+};
 
 // -----------------------------------------------------------------------------
-// Per-op payloads (schemas)
+// Per-op payloads (schemas) — all inputs/outputs/constants are Vid
 // -----------------------------------------------------------------------------
 struct NoopNode { };
 
-struct MatmulNode {
-  Tid a{}, b{};
-  Mid out{};
-  bool ta{false}, tb{false};
-  std::optional<Tid> bias{};
+// Linear (no implicit transposes; supply weights in the shape you want)
+struct LinearNode {
+  Vid x{}, weight{};
+  Vid out{};
+  std::optional<Vid> bias{};  // neural bias (post-matmul), usually constant
 };
 
 struct RMSNormNode {
-  Tid x{}, weight{};
-  Mid out{};
+  Vid x{}, weight{};
+  Vid out{};
   float eps{1e-5f};
 };
 
 struct RopeNode {
   // inputs
-  Tid q_in{}, k_in{};
+  Vid q_in{}, k_in{};
 
-  // optional precomputed frequency spectrum (a.k.a. inv_freq). If absent, kernel derives from base/dims.
-  std::optional<Tid> freq{std::nullopt};
+  // optional precomputed frequency spectrum (inv_freq). If absent, kernel derives from base/dims.
+  std::optional<Vid> freq{std::nullopt};  // usually a constant tensor
 
   // outputs
-  Mid q_out{}, k_out{};
+  Vid q_out{}, k_out{};
 
   // params
   int  head_dim{0};
@@ -45,113 +57,127 @@ struct RopeNode {
   std::optional<float> base{500000.f};
   float scale{1.0f};
 
-  I32Id pos{}; // runtime offset/cursor
+  Vid pos{};  // runtime scalar (int32) cursor
 };
 
 struct SdpaNode {
-  Tid q{}, k{}, v{};
-  Mid out{};
+  Vid q{}, k{}, v{};
+  Vid out{};
   float scale{1.0f};
-  std::optional<Tid> mask{};  // optional additive or boolean mask
-  bool causal{false};         // pass "causal" string mask to MLX if true and no tensor mask is provided
+  std::optional<Vid> mask{};  // optional additive or boolean mask tensor
+  bool causal{false};         // if true and mask unset, execute causal attention
 };
 
-struct AddNode  { Tid a{}, b{}; Mid out{}; };
-struct MulNode  { Tid a{}, b{}; Mid out{}; };
-struct SiluNode { Tid x{};      Mid out{}; };
+struct AddNode  { Vid a{}, b{}; Vid out{}; };
+struct MulNode  { Vid a{}, b{}; Vid out{}; };
+struct SiluNode { Vid x{};      Vid out{}; };
 
-struct ReshapeNode   { Tid x{}; Mid out{}; std::vector<int> shape; };
-struct TransposeNode { Tid x{}; Mid out{}; std::vector<int> perm;  };
-struct ContigNode    { Tid x{}; Mid out{}; };
+struct ReshapeNode   { Vid x{}; Vid out{}; std::vector<int> shape; };
+struct TransposeNode { Vid x{}; Vid out{}; std::vector<int> perm;  };
+struct ContigNode    { Vid x{}; Vid out{}; };
 
-struct GatherNode { Tid table{}, ids{}; Mid out{}; };
+struct GatherNode { Vid table{}, ids{}; Vid out{}; };
 
+/**
+ * Slice (single axis):
+ *  Selects a contiguous segment along `axis`.
+ *    - axis:  Vid of int scalar (target axis in x)
+ *    - start: Vid of int scalar (inclusive)
+ *    - length: Vid of int scalar (#elements; if negative, treat as "to end")
+ */
 struct SliceNode {
-  Tid x{};
-  Mid out{};
-  ShapeId start{};
-  ShapeId stop{};                    // -1 => to end of that dim (handled at runtime)
-  std::optional<ShapeId> strides{};  // nullopt => contiguous (all 1s)
+  Vid x{};
+  Vid out{};
+  Vid axis{};    // int scalar
+  Vid start{};   // int scalar
+  Vid length{};  // int scalar; negative => to end
 };
 
-struct ConcatNode { Tid a{}, b{}; Mid out{}; int axis{0}; };
+struct ConcatNode { Vid a{}, b{}; Vid out{}; int axis{0}; };
 
-struct CastNode  { Tid x{};  Mid out{}; DTypeId dtype{DTypeId::f16}; };
-struct FullNode  {            Mid out{}; std::vector<int> shape; float v{0.0f}; DTypeId dtype{DTypeId::f16}; };
-struct ZerosNode {            Mid out{}; std::vector<int> shape;                  DTypeId dtype{DTypeId::f16}; };
-struct OnesNode  {            Mid out{}; std::vector<int> shape;                  DTypeId dtype{DTypeId::f16}; };
+struct CastNode  { Vid x{};  Vid out{}; DTypeId dtype{DTypeId::f16}; };
+struct FullNode  {             Vid out{}; std::vector<int> shape; float v{0.0f}; DTypeId dtype{DTypeId::f16}; };
+struct ZerosNode {             Vid out{}; std::vector<int> shape;                  DTypeId dtype{DTypeId::f16}; };
+struct OnesNode  {             Vid out{}; std::vector<int> shape;                  DTypeId dtype{DTypeId::f16}; };
 
-struct ArgmaxNode { Tid x{}; Mid out{}; int axis{-1}; };
+struct ArgmaxNode { Vid x{}; Vid out{}; int axis{-1}; };
 
+/**
+ * SliceUpdate (single axis, in-place on dst):
+ *  Overwrites a contiguous segment of `dst` along `axis` starting at `start`
+ *  with `update`. If `length` is negative, infer from update.size(axis).
+ */
 struct SliceUpdateNode {
-  Mid dst{};
-  Tid update{};
-  ShapeId start{};
-  ShapeId stop{};                     // -1 => infer = start + update.shape()
-  std::optional<ShapeId> strides{};   // nullopt / all 1s => contiguous
+  Vid dst{};
+  Vid update{};
+  Vid axis{};    // int scalar
+  Vid start{};   // int scalar
+  Vid length{};  // int scalar; negative => infer from update.shape(axis)
 };
 
-// Quantized 4-bit linear using MLX fast::quantized_matmul
-struct QLinear4Node {
-  Tid x{};                 // [B, I] input (f16/f32/bf16)
-  Cid w{};                 // quantized weight (uint8)
-  Cid scales{};            // per-group scales
-  std::optional<Cid> biases{}; // optional "biases" from quantize() / for dequantize()
-  bool transpose{true};    // usually true (W^T multiply)
-  int group_size{64};      // e.g., 64
-  std::string mode{"affine"}; // "affine" or "symmetric"
+// Quantized linear using MLX fast quantized paths
+struct QuantizedLinearNode {
+  Vid x{};                         // [B, I] input (f16/f32/bf16)
+  Vid w{};                         // quantized weight (uint8) — constant
+  Vid scales{};                    // per-group scales — constant
+  std::optional<Vid> biases{};     // per-group *quantization* biases (affine dequant), optional
+  std::optional<Vid> bias{};       // neural bias vector (post-matmul), optional
+  int  group_size{64};             // e.g., 64
+  int  bits{4};                    // number of quantization bits (e.g., 4)
+  std::string mode{"affine"};      // "affine" or "symmetric"
   DTypeId out_dtype{DTypeId::f32}; // f16/f32/bf16
-  Mid out{};               // output (mutable)
+  Vid out{};                       // output
 };
 
-// Quantized 4-bit embedding lookup: gather rows from a Q4 table and dequantize
-struct QEmbed4Node {
-  Cid table_q4{};              // quantized embedding table [vocab, Dm] packed in uint8 nibbles
-  Cid scales{};                // per-group scales
-  std::optional<Cid> biases{}; // optional "biases" from quantize() (used by dequantize)
-  int group_size{64};          // quantization group size along the feature dim
-  std::string mode{"affine"};  // "affine" or "symmetric"
+// Quantized embedding/gather with dequantization (no neural bias here)
+struct QuantizedGatherNode {
+  Vid table_q{};                   // quantized embedding table [vocab, Dm] — constant (uint8 nibbles)
+  Vid scales{};                    // per-group scales — constant
+  std::optional<Vid> biases{};     // per-group *quantization* biases (affine dequant), optional
+  int  group_size{64};             // quantization group size along the feature dim
+  int  bits{4};                    // number of quantization bits (e.g., 4)
+  std::string mode{"affine"};      // "affine" or "symmetric"
   DTypeId out_dtype{DTypeId::f32}; // output activation dtype
-  Tid ids{};                   // [B, T] token ids
-  Mid out{};                   // [B, T, Dm] dequantized embedding activations
+  Vid ids{};                       // [B, T] token ids
+  Vid out{};                       // [B, T, Dm] dequantized embedding activations
 };
 
 // -----------------------------------------------------------------------------
 // X-macro master list: single source of truth (NAME, PAYLOAD_TYPE)
 // -----------------------------------------------------------------------------
 #ifndef LLM_OP_LIST
-#define LLM_OP_LIST(X)                      \
-  X(NOOP,          NoopNode)                \
-  /* Math / linear */                       \
-  X(MATMUL,        MatmulNode)              \
-  X(RMS_NORM,      RMSNormNode)             \
-  /* Attention */                           \
-  X(SDPA,          SdpaNode)                \
-  X(ROPE_APPLY,    RopeNode)                \
-  /* Elementwise */                         \
-  X(ADD,           AddNode)                 \
-  X(MUL,           MulNode)                 \
-  X(SILU,          SiluNode)                \
-  /* Shapes */                              \
-  X(RESHAPE,       ReshapeNode)             \
-  X(TRANSPOSE,     TransposeNode)           \
-  X(CONTIGUOUS,    ContigNode)              \
-  /* Indexing / cache */                    \
-  X(GATHER,        GatherNode)              \
-  X(SLICE,         SliceNode)               \
-  X(CONCAT,        ConcatNode)              \
-  /* Dtype / const */                       \
-  X(CAST,          CastNode)                \
-  X(FULL,          FullNode)                \
-  X(ZEROS,         ZerosNode)               \
-  X(ONES,          OnesNode)                \
-  /* Sampling */                            \
-  X(ARGMAX,        ArgmaxNode)              \
-  /* In-place */                            \
-  X(SLICE_UPDATE,  SliceUpdateNode)         \
-  /* Quantized */                           \
-  X(QEMBED4,       QEmbed4Node)             \
-  X(QLINEAR4,      QLinear4Node)
+#define LLM_OP_LIST(X)                            \
+  X(NOOP,                NoopNode)                \
+  /* Math / linear */                             \
+  X(LINEAR,              LinearNode)              \
+  X(RMS_NORM,            RMSNormNode)             \
+  /* Attention */                                 \
+  X(SDPA,                SdpaNode)                \
+  X(ROPE_APPLY,          RopeNode)                \
+  /* Elementwise */                               \
+  X(ADD,                 AddNode)                 \
+  X(MUL,                 MulNode)                 \
+  X(SILU,                SiluNode)                \
+  /* Shapes */                                    \
+  X(RESHAPE,             ReshapeNode)             \
+  X(TRANSPOSE,           TransposeNode)           \
+  X(CONTIGUOUS,          ContigNode)              \
+  /* Indexing / cache */                          \
+  X(GATHER,              GatherNode)              \
+  X(SLICE,               SliceNode)               \
+  X(CONCAT,              ConcatNode)              \
+  /* Dtype / const */                             \
+  X(CAST,                CastNode)                \
+  X(FULL,                FullNode)                \
+  X(ZEROS,               ZerosNode)               \
+  X(ONES,                OnesNode)                \
+  /* Sampling */                                  \
+  X(ARGMAX,              ArgmaxNode)              \
+  /* In-place */                                  \
+  X(SLICE_UPDATE,        SliceUpdateNode)         \
+  /* Quantized */                                  \
+  X(QUANTIZED_GATHER,    QuantizedGatherNode)     \
+  X(QUANTIZED_LINEAR,    QuantizedLinearNode)
 #endif
 
 // -----------------------------------------------------------------------------
@@ -209,6 +235,9 @@ static constexpr const char* kOpName[static_cast<size_t>(OpCode::SENTINEL)] = {
   LLM_OP_LIST(NAME_ROW)
 #undef NAME_ROW
 };
+static_assert(sizeof(kOpName) / sizeof(kOpName[0]) ==
+              static_cast<size_t>(OpCode::SENTINEL),
+              "kOpName size must match OpCode::SENTINEL");
 
 // -----------------------------------------------------------------------------
 // Instruction (compile-time factory uses index-based emplace to disambiguate)
