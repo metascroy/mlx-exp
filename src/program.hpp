@@ -9,6 +9,7 @@
 #include <utility>
 #include <vector>
 #include <variant>
+#include <unordered_map>
 
 #include <mlx/array.h>
 #include <mlx/ops.h>
@@ -39,69 +40,90 @@ struct ConstantData {
 // Mutable per-session data (inputs, outputs, state, temps, scalars, shapes)
 // ----------------------------------------------------------------------------
 struct MutableData {
-  std::vector<std::optional<Tensor>> M;
-  std::vector<int>              i32;
-  std::vector<float>            f32;
-  std::vector<::mlx::core::Shape> shape;
+  using Tensor = ::mlx::core::array;
 
-  // ---- setters ----
+  // Sparse storage keyed by ID indices
+  std::unordered_map<uint32_t, Tensor>              M;      // Mid -> tensor
+  std::unordered_map<uint32_t, int>                 i32;    // I32Id -> value
+  std::unordered_map<uint32_t, float>               f32;    // F32Id -> value
+  std::unordered_map<uint32_t, ::mlx::core::Shape>  shape;  // ShapeId -> shape
+
+  // Optionally reserve buckets up-front (helps perf if you know rough counts)
+  inline void reserve(size_t num_tensors,
+                      size_t num_i32 = 8,
+                      size_t num_f32 = 8,
+                      size_t num_shapes = 8) {
+    M.reserve(num_tensors);
+    i32.reserve(num_i32);
+    f32.reserve(num_f32);
+    shape.reserve(num_shapes);
+  }
+
+  // ---- setters (no pre-size; just insert/overwrite) ----
   inline void set_mutable_id(Mid id, Tensor v) {
-    if (id.idx >= M.size()) M.resize(id.idx + 1);
-    M[id.idx] = std::move(v);
+    M.insert_or_assign(id.idx, std::move(v));
   }
   inline void set_i32_id(I32Id id, int v) {
-    if (id.idx >= i32.size()) i32.resize(id.idx + 1);
     i32[id.idx] = v;
   }
   inline void set_f32_id(F32Id id, float v) {
-    if (id.idx >= f32.size()) f32.resize(id.idx + 1);
     f32[id.idx] = v;
   }
   inline void set_shape_id(ShapeId id, const std::vector<int>& v) {
-    if (id.idx >= shape.size()) shape.resize(id.idx + 1);
     shape[id.idx] = ::mlx::core::Shape(v.begin(), v.end());
   }
 
-  // ---- refs (throwing) ----
+  // ---- refs (throwing if missing) ----
   inline Tensor& m_ref(Mid id) {
-    if (id.idx >= M.size() || !M[id.idx].has_value())
+    auto it = M.find(id.idx);
+    if (it == M.end())
       throw std::runtime_error("Missing tensor for Mid idx=" + std::to_string(id.idx));
-    return M[id.idx].value();
+    return it->second;
   }
   inline const Tensor& m_ref(Mid id) const {
-    if (id.idx >= M.size() || !M[id.idx].has_value())
+    auto it = M.find(id.idx);
+    if (it == M.end())
       throw std::runtime_error("Missing tensor for Mid idx=" + std::to_string(id.idx));
-    return M[id.idx].value();
+    return it->second;
   }
+
   inline int& i32_ref(I32Id id) {
-    if (id.idx >= i32.size())
+    auto it = i32.find(id.idx);
+    if (it == i32.end())
       throw std::out_of_range("i32_ref: uninitialized I32Id idx=" + std::to_string(id.idx));
-    return i32[id.idx];
-  }
-  inline float& f32_ref(F32Id id) {
-    if (id.idx >= f32.size())
-      throw std::out_of_range("f32_ref: uninitialized F32Id idx=" + std::to_string(id.idx));
-    return f32[id.idx];
-  }
-  inline ::mlx::core::Shape& shape_ref(ShapeId id) {
-    if (id.idx >= shape.size())
-      throw std::out_of_range("shape_ref: uninitialized ShapeId idx=" + std::to_string(id.idx));
-    return shape[id.idx];
+    return it->second;
   }
   inline const int& i32_ref(I32Id id) const {
-    if (id.idx >= i32.size())
+    auto it = i32.find(id.idx);
+    if (it == i32.end())
       throw std::out_of_range("i32_ref(const): uninitialized I32Id idx=" + std::to_string(id.idx));
-    return i32[id.idx];
+    return it->second;
+  }
+
+  inline float& f32_ref(F32Id id) {
+    auto it = f32.find(id.idx);
+    if (it == f32.end())
+      throw std::out_of_range("f32_ref: uninitialized F32Id idx=" + std::to_string(id.idx));
+    return it->second;
   }
   inline const float& f32_ref(F32Id id) const {
-    if (id.idx >= f32.size())
+    auto it = f32.find(id.idx);
+    if (it == f32.end())
       throw std::out_of_range("f32_ref(const): uninitialized F32Id idx=" + std::to_string(id.idx));
-    return f32[id.idx];
+    return it->second;
+  }
+
+  inline ::mlx::core::Shape& shape_ref(ShapeId id) {
+    auto it = shape.find(id.idx);
+    if (it == shape.end())
+      throw std::out_of_range("shape_ref: uninitialized ShapeId idx=" + std::to_string(id.idx));
+    return it->second;
   }
   inline const ::mlx::core::Shape& shape_ref(ShapeId id) const {
-    if (id.idx >= shape.size())
+    auto it = shape.find(id.idx);
+    if (it == shape.end())
       throw std::out_of_range("shape_ref(const): uninitialized ShapeId idx=" + std::to_string(id.idx));
-    return shape[id.idx];
+    return it->second;
   }
 };
 

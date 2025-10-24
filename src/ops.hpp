@@ -8,7 +8,8 @@
 #include <utility>
 #include <functional>
 #include <array>
-#include "id.hpp"  // Mid, Cid, Tid=std::variant<Mid,Cid>, I32Id, F32Id, ShapeId, DTypeId
+#include <string>     // ← needed for QLinear4Node::mode / QEmbed4Node::mode
+#include "id.hpp"     // Mid, Cid, Tid=std::variant<Mid,Cid>, I32Id, F32Id, ShapeId, DTypeId
 
 // -----------------------------------------------------------------------------
 // Per-op payloads (schemas)
@@ -39,7 +40,7 @@ struct RopeNode {
   Mid q_out{}, k_out{};
 
   // params
-  int  head_dim{};
+  int  head_dim{0};
   bool traditional{false};
   std::optional<float> base{500000.f};
   float scale{1.0f};
@@ -52,7 +53,7 @@ struct SdpaNode {
   Mid out{};
   float scale{1.0f};
   std::optional<Tid> mask{};  // optional additive or boolean mask
-  bool causal{false};         // NEW: pass "causal" string mask to MLX if true and no tensor mask is provided
+  bool causal{false};         // pass "causal" string mask to MLX if true and no tensor mask is provided
 };
 
 struct AddNode  { Tid a{}, b{}; Mid out{}; };
@@ -73,14 +74,14 @@ struct SliceNode {
   std::optional<ShapeId> strides{};  // nullopt => contiguous (all 1s)
 };
 
-struct ConcatNode { Tid a{}, b{}; Mid out{}; int axis{}; };
+struct ConcatNode { Tid a{}, b{}; Mid out{}; int axis{0}; };
 
 struct CastNode  { Tid x{};  Mid out{}; DTypeId dtype{DTypeId::f16}; };
-struct FullNode  {            Mid out{}; std::vector<int> shape; float v{}; DTypeId dtype{DTypeId::f16}; };
-struct ZerosNode {            Mid out{}; std::vector<int> shape;            DTypeId dtype{DTypeId::f16}; };
-struct OnesNode  {            Mid out{}; std::vector<int> shape;            DTypeId dtype{DTypeId::f16}; };
+struct FullNode  {            Mid out{}; std::vector<int> shape; float v{0.0f}; DTypeId dtype{DTypeId::f16}; };
+struct ZerosNode {            Mid out{}; std::vector<int> shape;                  DTypeId dtype{DTypeId::f16}; };
+struct OnesNode  {            Mid out{}; std::vector<int> shape;                  DTypeId dtype{DTypeId::f16}; };
 
-struct ArgmaxNode { Tid x{}; Mid out{}; int axis{}; };
+struct ArgmaxNode { Tid x{}; Mid out{}; int axis{-1}; };
 
 struct SliceUpdateNode {
   Mid dst{};
@@ -88,6 +89,31 @@ struct SliceUpdateNode {
   ShapeId start{};
   ShapeId stop{};                     // -1 => infer = start + update.shape()
   std::optional<ShapeId> strides{};   // nullopt / all 1s => contiguous
+};
+
+// Quantized 4-bit linear using MLX fast::quantized_matmul
+struct QLinear4Node {
+  Tid x{};                 // [B, I] input (f16/f32/bf16)
+  Cid w{};                 // quantized weight (uint8)
+  Cid scales{};            // per-group scales
+  std::optional<Cid> biases{}; // optional "biases" from quantize() / for dequantize()
+  bool transpose{true};    // usually true (W^T multiply)
+  int group_size{64};      // e.g., 64
+  std::string mode{"affine"}; // "affine" or "symmetric"
+  DTypeId out_dtype{DTypeId::f32}; // f16/f32/bf16
+  Mid out{};               // output (mutable)
+};
+
+// Quantized 4-bit embedding lookup: gather rows from a Q4 table and dequantize
+struct QEmbed4Node {
+  Cid table_q4{};              // quantized embedding table [vocab, Dm] packed in uint8 nibbles
+  Cid scales{};                // per-group scales
+  std::optional<Cid> biases{}; // optional "biases" from quantize() (used by dequantize)
+  int group_size{64};          // quantization group size along the feature dim
+  std::string mode{"affine"};  // "affine" or "symmetric"
+  DTypeId out_dtype{DTypeId::f32}; // output activation dtype
+  Tid ids{};                   // [B, T] token ids
+  Mid out{};                   // [B, T, Dm] dequantized embedding activations
 };
 
 // -----------------------------------------------------------------------------
@@ -122,7 +148,10 @@ struct SliceUpdateNode {
   /* Sampling */                            \
   X(ARGMAX,        ArgmaxNode)              \
   /* In-place */                            \
-  X(SLICE_UPDATE,  SliceUpdateNode)
+  X(SLICE_UPDATE,  SliceUpdateNode)         \
+  /* Quantized */                           \
+  X(QEMBED4,       QEmbed4Node)             \
+  X(QLINEAR4,      QLinear4Node)
 #endif
 
 // -----------------------------------------------------------------------------
@@ -194,7 +223,7 @@ struct Instr {
   static Instr make(OpPayloadT<OC> payload) {
     Instr i;
     i.op = OC;
-    // Emplace by index so duplicate types (e.g., MatmulNode) are unambiguous
+    // Emplace by index so duplicate types are unambiguous
     i.node.template emplace<OpVariantIndex<OC>::value>(std::move(payload));
     return i;
   }

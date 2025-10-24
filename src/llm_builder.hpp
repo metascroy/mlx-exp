@@ -1,4 +1,4 @@
-//  llm_builder.hpp (drop-in replacement)
+//  llm_builder.hpp (drop-in replacement with MidPool temp reuse)
 #pragma once
 #include <random>
 #include <vector>
@@ -6,22 +6,48 @@
 #include <optional>
 #include <cmath>
 #include <cassert>
+#include <fstream>
+#include <iostream>
+#include <sstream>
 
 #include "id.hpp"
 #include "ops.hpp"
 #include "program.hpp"
 #include "interpreter.hpp"
-#include <fstream>
 
 #include <mlx/array.h>
 #include <mlx/ops.h>
 #include <mlx/fast.h>
+
 #include <torch/script.h>
 #include <torch/serialize.h>
 #include <ATen/ATen.h>
 #include <torch/torch.h>
 
 namespace executorch::mlx {
+
+// =====================================================
+// Feature flags
+// =====================================================
+
+// Use quantized matmul nodes where available (weights prepared in loader)
+inline constexpr bool kUseQuantizedMatMul = true;   // set true to enable Q4 paths
+// Use quantized embedding (QEMBED4) where available
+inline constexpr bool kUseQuantizedEmbed = false;    // set true to enable Q4 embedding
+
+// Choose ONE compute dtype for the entire run (weights, activations, KV)
+inline constexpr DTypeId kComputeDType = DTypeId::f32;  // {f16, bf16, f32}
+
+// Map our DTypeId → MLX dtype symbol
+inline auto to_mlx_dtype(DTypeId id) {
+  using namespace ::mlx::core;
+  switch (id) {
+    case DTypeId::f16:   return float16;
+    case DTypeId::bf16:  return bfloat16;
+    case DTypeId::f32:   return float32;
+    default:             return float32;
+  }
+}
 
 // =====================================================
 // Small utilities
@@ -37,23 +63,13 @@ inline std::vector<float> host_uniform(size_t n, float lo=-0.02f, float hi=0.02f
 inline ::mlx::core::array make_array_f32(const std::vector<float>& host,
                                          const std::vector<int>& shape) {
   using namespace ::mlx::core;
-  // Iterator constructor => MLX-owned memory (no alias to host)
   array a(host.begin(), Shape{static_cast<int>(host.size())}, float32);
   return reshape(a, Shape(shape.begin(), shape.end()));
 }
 
 // =====================================================
-// Simple decoder config / LLaMA cfg
+// LLaMA cfg
 // =====================================================
-struct DecoderCfg {
-  int B{1};
-  int H{2};
-  int T_max{16};
-  int D_model{32};
-  int D_head{16};
-  int T_prefill{4};
-};
-
 struct LlamaCfg {
   int B{1};
   int T_max{4096};
@@ -67,15 +83,32 @@ struct LlamaCfg {
   int T_seq{16};    // only used for initial shapes in state
 
   // RoPE & norm
-  bool  rope_traditional{false};  // LLaMA uses "new" rope
-  float rope_theta{500000.0f};    // 5e5 (Llama-3); set 10000.0f for Llama-2
+  bool  rope_traditional{false};  // LLaMA uses "new" rope (false)
+  float rope_theta{500000.0f};    // 5e5 (Llama-3); use 10000.0 for Llama-2
   int   rope_dims{-1};            // -1 => full per-head dim
   float rms_eps{1e-6f};           // LLaMA typically 1e-6
 };
 
-struct Weights {
-  Cid Wq, Wk, Wv, Wo;
-  std::optional<Cid> bq, bk, bv, bo;
+// ---------- Optional Q4 metadata held next to FP weights ----------
+struct Q4Linear {
+  std::optional<Cid> w_q4;      // quantized weights (uint8 nibbles)
+  std::optional<Cid> scales;    // per-group scales
+  std::optional<Cid> biases;    // optional bias (FP, if quantize() returns it)
+  bool        transpose{false}; // usually false (layout baked already)
+  int         group_size{64};
+  std::string mode{"affine"};   // "affine" or "symmetric"
+  DTypeId     out_dtype{kComputeDType};
+  inline bool valid() const { return w_q4.has_value() && scales.has_value(); }
+};
+
+struct Q4Embedding {
+  std::optional<Cid> table_q4;  // quantized table [vocab, Dm] (uint8-packed)
+  std::optional<Cid> scales;    // per-group scales
+  std::optional<Cid> biases;    // optional biases from quantize()
+  int         group_size{64};
+  std::string mode{"affine"};
+  DTypeId     out_dtype{kComputeDType};
+  inline bool valid() const { return table_q4.has_value() && scales.has_value(); }
 };
 
 struct LlamaLayerWeights {
@@ -88,11 +121,21 @@ struct LlamaLayerWeights {
   Cid W_gate;       // [D_model, d_ff]
   Cid W_up;         // [D_model, d_ff]
   Cid W_down;       // [d_ff, D_model]
+
+  // Optional quantized variants used when kUseQuantizedMatMul=true
+  Q4Linear Wq_q4, Wk_q4, Wv_q4, Wo_q4, W_gate_q4, W_up_q4, W_down_q4;
 };
 
 struct LlamaWeights {
-  Cid tok_emb;      // [vocab, D_model]
-  Cid lm_head;      // alias to tok_emb (tied embeddings)
+  // Embedding
+  Cid tok_emb;            // [vocab, D_model]  (for Gather fallback)
+  Q4Embedding tok_emb_q4; // Q4 metadata (for QEMBED4)
+
+  // Output head
+  Cid lm_head;      // (alias to tok_emb if tied; kept for completeness)
+  Cid lm_head_T;    // [D_model, vocab]  (projection weight for logits)
+  Q4Linear lm_head_q4; // quantized metadata for lm_head_T
+
   std::vector<LlamaLayerWeights> layers;
   Cid w_rms_final;  // [D_model]
 };
@@ -111,42 +154,85 @@ struct LlamaCaches {
   std::vector<CacheIds> layer_cache; // per-layer KV
 };
 
-// Just markers in codegen; no ZEROS ops in Program.
-enum class KvCacheMode { ReuseOnly };
+// -----------------------------------------------------
+// MidPool: per-layer temp-id reuse (acquire → use → release)
+// -----------------------------------------------------
+struct MidPool {
+  uint32_t base;        // start of the temp-id range
+  uint32_t cap;         // number of ids reserved for this pool
+  uint32_t next = 0;    // bump ptr
+  std::vector<Mid> free;
+
+  MidPool(uint32_t base_, uint32_t cap_) : base(base_), cap(cap_) {}
+
+  inline Mid acquire() {
+    if (!free.empty()) { Mid m = free.back(); free.pop_back(); return m; }
+    if (next >= cap) throw std::runtime_error("MidPool exhausted");
+    return Mid{static_cast<uint32_t>(base + next++)};
+  }
+  inline void release(Mid m) { free.push_back(m); }
+};
 
 // -----------------------------------------------------
-// Reshape helpers with T inference (-1)
+// Reshape helpers with T inference (only ONE -1 allowed)
 // -----------------------------------------------------
-inline void add_reshape_BT_Dm_to_BHTDh(Program& prog, Tid x, int B,int H,int Dh, Mid out) {
-  ReshapeNode r; r.x = x; r.out = out; r.shape = {B, -1, H, Dh};
-  prog.code.push_back(make_RESHAPE(std::move(r)));
-}
-
-inline void add_reshape_BHTDh_to_BT_Dm(Program& prog, Tid x, int B,int H,int Dh, Mid out) {
-  ReshapeNode r; r.x = x; r.out = out; r.shape = {B, -1, H*Dh};
+inline void add_reshape_BHTDh_to_BT_Dm(Program& prog, Tid x, int B, int H, int Dh, Mid out) {
+  ReshapeNode r; r.x = x; r.out = out; r.shape = { B, -1, H*Dh };  // infer T only
   prog.code.push_back(make_RESHAPE(std::move(r)));
 }
 
 // -----------------------------------------------------
 // Linear projections packed to heads (supports H_out != H)
+// (Q4-aware via optional parameter)
 // -----------------------------------------------------
-inline void add_project_and_pack_heads(Program& prog, Tid xBTDm, Cid W, std::optional<Cid> b,
-                                       int B,int H_out,int Dh,
-                                       Mid tmp_proj /*[B,-1,H_out*Dh]*/,
-                                       Mid tmp_BTHDh /*[B,-1,H_out,Dh]*/,
-                                       Mid out /*[B,H_out,-1,Dh]*/) {
-  // x:[B,-1,Dm], W:[Dm,H_out*Dh] -> tmp_proj:[B,-1,H_out*Dh]
-  MatmulNode mm; mm.a=xBTDm; mm.b=Tid{W}; mm.out=tmp_proj; mm.ta=false; mm.tb=false;
-  if (b) mm.bias = Tid{*b};
-  prog.code.push_back(make_MATMUL(std::move(mm)));
+inline Mid add_linear_qaware(Program& prog,
+                             Tid xBTDm,
+                             Cid W_fp, std::optional<Cid> b_fp,
+                             const Q4Linear& q4,
+                             Mid outBTDo) {
+  if (kUseQuantizedMatMul && q4.valid()) {
+    QLinear4Node qn;
+    qn.x         = xBTDm;
+    qn.w         = *q4.w_q4;
+    qn.scales    = *q4.scales;
+    if (q4.biases) qn.biases = *q4.biases; // optional FP bias
+    qn.transpose = q4.transpose;
+    qn.group_size= q4.group_size;
+    qn.mode      = q4.mode;
+    qn.out_dtype = q4.out_dtype;
+    qn.out       = outBTDo;
+    prog.code.push_back(make_QLINEAR4(std::move(qn)));
+    if (b_fp) { // explicit bias if kept separate
+      AddNode add; add.a = outBTDo; add.b = Tid{*b_fp}; add.out = outBTDo;
+      prog.code.push_back(make_ADD(std::move(add)));
+    }
+  } else {
+    MatmulNode mm; mm.a = xBTDm; mm.b = Tid{W_fp}; mm.out = outBTDo; mm.ta=false; mm.tb=false;
+    if (b_fp) mm.bias = Tid{*b_fp};
+    prog.code.push_back(make_MATMUL(std::move(mm)));
+  }
+  return outBTDo;
+}
 
-  // Reshape to [B,-1,H_out,Dh]
-  ReshapeNode r; r.x = Tid{tmp_proj}; r.out = tmp_BTHDh; r.shape = {B, -1, H_out, Dh};
+// pooled variant (allocates only short-lived temps via pool)
+inline void add_project_and_pack_heads_pooled(Program& prog, MidPool& pool,
+                                              Tid xBTDm, Cid W, std::optional<Cid> b,
+                                              int B, int H_out, int Dh,
+                                              Mid out /*[B,H_out,-1,Dh]*/,
+                                              const Q4Linear& q4 = {}) {
+  Mid tmp_proj  = pool.acquire();   // [B,-1,H_out*Dh]
+  Mid tmp_BTHDh = pool.acquire();   // [B,-1,H_out,Dh]
+
+  add_linear_qaware(prog, xBTDm, W, b, q4, tmp_proj);
+
+  ReshapeNode r; r.x = Tid{tmp_proj}; r.out = tmp_BTHDh; r.shape = { B, -1, H_out, Dh };
   prog.code.push_back(make_RESHAPE(std::move(r)));
 
-  // [B,-1,H_out,Dh] -> [B,H_out,-1,Dh]
   TransposeNode tp; tp.x = Tid{tmp_BTHDh}; tp.out = out; tp.perm = {0,2,1,3};
   prog.code.push_back(make_TRANSPOSE(std::move(tp)));
+
+  pool.release(tmp_BTHDh);
+  pool.release(tmp_proj);
 }
 
 // -----------------------------------------------------
@@ -182,7 +268,6 @@ inline void add_sdpa(Program& prog, Tid q, Tid k, Tid v,
   sd.scale = scale;
   sd.mask = mask;
   sd.causal = causal;
-
   prog.code.push_back(make_SDPA(std::move(sd)));
 }
 
@@ -209,113 +294,33 @@ inline void add_kv_read_window(Program& prog, const CacheIds& cache, Mid K_win, 
   prog.code.push_back(make_SLICE(std::move(v_sl)));
 }
 
-inline void add_output_projection(Program& prog, Tid attn_BHTDh,
-                                  Cid Wo, std::optional<Cid> bo,
-                                  int B,int H,int Dh, int Dm,
-                                  Mid tmp_BTHDh, Mid tmp_BTHDmpacked, Mid out_BTDm) {
+// pooled version of output projection
+inline void add_output_projection_pooled(Program& prog, MidPool& pool,
+                                         Tid attn_BHTDh,
+                                         Cid Wo, std::optional<Cid> bo,
+                                         int B, int H, int Dh, int /*Dm*/,
+                                         Mid out_BTDm,
+                                         const Q4Linear& Wo_q4 = {}) {
+  Mid tmp_BTHDh       = pool.acquire(); // [B,-1,H,Dh]
+  Mid tmp_BTHDmpacked = pool.acquire(); // [B,-1,H*Dh]
+
   // [B,H,-1,Dh] -> [B,-1,H,Dh]
   TransposeNode tp; tp.x=attn_BHTDh; tp.out=tmp_BTHDh; tp.perm={0,2,1,3};
   prog.code.push_back(make_TRANSPOSE(std::move(tp)));
 
   // [B,-1,H,Dh] -> [B,-1,H*Dh]
-  add_reshape_BHTDh_to_BT_Dm(prog, Tid{tmp_BTHDh}, B,H,Dh, tmp_BTHDmpacked);
+  add_reshape_BHTDh_to_BT_Dm(prog, Tid{tmp_BTHDh}, B, H, Dh, tmp_BTHDmpacked);
 
   // [B,-1,H*Dh] x [H*Dh,Dm] -> [B,-1,Dm]
-  MatmulNode mm; mm.a=Tid{tmp_BTHDmpacked}; mm.b=Tid{Wo}; mm.out=out_BTDm;
-  if (bo) mm.bias = Tid{*bo};
-  prog.code.push_back(make_MATMUL(std::move(mm)));
+  add_linear_qaware(prog, Tid{tmp_BTHDmpacked}, Wo, bo, Wo_q4, out_BTDm);
+
+  pool.release(tmp_BTHDmpacked);
+  pool.release(tmp_BTHDh);
 }
 
 // -----------------------------------------------------
-// Runtime shape updates for prefill/decode (shared across layers)
-// -----------------------------------------------------
-inline void set_prefill_cursor_and_shapes(MutableData& st, int B,int H,int Dh, int T_written,
-                                          const CacheIds& c) {
-  // Cursor must be 0 for RoPE during prefill.
-  st.set_i32_id(c.cursor, 0);
-
-  st.set_shape_id(c.sh_strides, {1,1,1,1});
-  st.set_shape_id(c.sh_start,   {0,0,0,0});
-  st.set_shape_id(c.sh_stop,    {B,H,T_written,Dh});
-
-  // Read window covers everything written so far
-  st.set_shape_id(c.sh_kv_read_start, {0,0,0,0});
-  st.set_shape_id(c.sh_kv_read_stop,  {B,H,T_written,Dh});
-}
-
-inline void advance_decode_cursor(MutableData& st, int B,int H,int Dh,
-                                  const CacheIds& c, int cursor, int t_step) {
-  const int new_cursor = cursor + t_step;
-  st.set_i32_id(c.cursor, new_cursor);
-  st.set_shape_id(c.sh_start, {0,0,cursor,0});
-  st.set_shape_id(c.sh_stop,  {B,H,new_cursor,Dh});
-  st.set_shape_id(c.sh_kv_read_start, {0,0,0,0});
-  st.set_shape_id(c.sh_kv_read_stop,  {B,H,new_cursor,Dh});
-}
-
-// -----------------------------------------------------
-// Weights (bf16) – write into ConstantData via add()
-// -----------------------------------------------------
-inline Weights register_random_weights(ConstantData& C, const DecoderCfg& cfg, uint32_t seed=123) {
-  using namespace ::mlx::core;
-  const int Dm = cfg.D_model, H = cfg.H, Dh = cfg.D_head;
-  auto Wq = astype(make_array_f32(host_uniform(static_cast<size_t>(Dm)*H*Dh, -0.02f, 0.02f, seed+1), {Dm, H*Dh}), bfloat16);
-  auto Wk = astype(make_array_f32(host_uniform(static_cast<size_t>(Dm)*H*Dh, -0.02f, 0.02f, seed+2), {Dm, H*Dh}), bfloat16);
-  auto Wv = astype(make_array_f32(host_uniform(static_cast<size_t>(Dm)*H*Dh, -0.02f, 0.02f, seed+3), {Dm, H*Dh}), bfloat16);
-  auto Wo = astype(make_array_f32(host_uniform(static_cast<size_t>(H*Dh)*Dm, -0.02f, 0.02f, seed+4), {H*Dh, Dm}), bfloat16);
-  return Weights{
-    C.add(std::move(Wq)),
-    C.add(std::move(Wk)),
-    C.add(std::move(Wv)),
-    C.add(std::move(Wo)),
-    std::nullopt,std::nullopt,std::nullopt,std::nullopt
-  };
-}
-
-inline LlamaWeights register_random_llama_weights(ConstantData& C, const LlamaCfg& cfg, uint32_t seed=1234) {
-  using namespace ::mlx::core;
-  LlamaWeights W;
-
-  // Tied embeddings: only store tok_emb; lm_head aliases to tok_emb in struct.
-  auto E = astype(make_array_f32(host_uniform(static_cast<size_t>(cfg.vocab)*cfg.D_model, -0.02f, 0.02f, seed+0),
-                                 {cfg.vocab, cfg.D_model}), bfloat16);
-  W.tok_emb = C.add(std::move(E));
-  W.lm_head = W.tok_emb; // tie
-
-  auto wfin = astype(make_array_f32(host_uniform(static_cast<size_t>(cfg.D_model), 0.9f, 1.1f, seed+2),
-                                    {cfg.D_model}), bfloat16);
-  W.w_rms_final = C.add(std::move(wfin));
-
-  W.layers.resize(cfg.n_layers);
-  for (int l=0; l<cfg.n_layers; ++l) {
-    auto& L = W.layers[l];
-    auto wa = astype(make_array_f32(host_uniform(static_cast<size_t>(cfg.D_model), 0.9f, 1.1f, seed+10*l+0), {cfg.D_model}), bfloat16);
-    auto wm = astype(make_array_f32(host_uniform(static_cast<size_t>(cfg.D_model), 0.9f, 1.1f, seed+10*l+1), {cfg.D_model}), bfloat16);
-    L.w_rms_attn = C.add(std::move(wa));
-    L.w_rms_mlp  = C.add(std::move(wm));
-
-    // Q uses H heads; K,V use H_kv heads (GQA)
-    auto Wq = astype(make_array_f32(host_uniform((size_t)cfg.D_model * cfg.H    * cfg.D_head, -0.02f,0.02f, seed+10*l+2), {cfg.D_model, cfg.H    * cfg.D_head}), bfloat16);
-    auto Wk = astype(make_array_f32(host_uniform((size_t)cfg.D_model * cfg.H_kv * cfg.D_head, -0.02f,0.02f, seed+10*l+3), {cfg.D_model, cfg.H_kv * cfg.D_head}), bfloat16);
-    auto Wv = astype(make_array_f32(host_uniform((size_t)cfg.D_model * cfg.H_kv * cfg.D_head, -0.02f,0.02f, seed+10*l+4), {cfg.D_model, cfg.H_kv * cfg.D_head}), bfloat16);
-    auto Wo = astype(make_array_f32(host_uniform((size_t)cfg.H * cfg.D_head * cfg.D_model,      -0.02f,0.02f, seed+10*l+5), {cfg.H * cfg.D_head, cfg.D_model}), bfloat16);
-    L.Wq = C.add(std::move(Wq));
-    L.Wk = C.add(std::move(Wk));
-    L.Wv = C.add(std::move(Wv));
-    L.Wo = C.add(std::move(Wo));
-
-    auto Wg = astype(make_array_f32(host_uniform((size_t)cfg.D_model * cfg.d_ff, -0.02f,0.02f, seed+10*l+6), {cfg.D_model, cfg.d_ff}), bfloat16);
-    auto Wu = astype(make_array_f32(host_uniform((size_t)cfg.D_model * cfg.d_ff, -0.02f,0.02f, seed+10*l+7), {cfg.D_model, cfg.d_ff}), bfloat16);
-    auto Wd = astype(make_array_f32(host_uniform((size_t)cfg.d_ff * cfg.D_model, -0.02f,0.02f, seed+10*l+8), {cfg.d_ff, cfg.D_model}), bfloat16);
-    L.W_gate = C.add(std::move(Wg));
-    L.W_up   = C.add(std::move(Wu));
-    L.W_down = C.add(std::move(Wd));
-  }
-  return W;
-}
-
-// -----------------------------------------------------
-// Torch -> MLX weights (Float32 owned; optional downcast later)
+// Torch -> MLX weights (Float32 owned; downcast to global compute dtype)
+// Also emits Q4 params via ::mlx::core::quantize when flag enabled.
 // -----------------------------------------------------
 inline LlamaWeights load_llama_weights_from_torch(const std::string& path,
                                                   ConstantData& C,
@@ -328,26 +333,11 @@ inline LlamaWeights load_llama_weights_from_torch(const std::string& path,
   using ::mlx::core::reshape;
   using ::mlx::core::astype;
   using ::mlx::core::float32;
-  using ::mlx::core::float16;
-  using ::mlx::core::bfloat16;
+  using ::mlx::core::quantize;
 
-  constexpr bool k_downcast_to_f16 = true; // enable after bring-up
-
-  auto dbg_stats = [&](const char* name, const array& A) {
-    auto Af = astype(A, float32);
-    auto nfin = ::mlx::core::sum(::mlx::core::astype(::mlx::core::isfinite(Af), float32)); nfin.eval();
-    auto nnan = ::mlx::core::sum(::mlx::core::astype(::mlx::core::isnan(Af), float32));    nnan.eval();
-    auto ninf = ::mlx::core::sum(::mlx::core::astype(::mlx::core::isinf(Af), float32));    ninf.eval();
-    auto mn = ::mlx::core::min(Af); mn.eval();
-    auto mx = ::mlx::core::max(Af); mx.eval();
-
-    double total = 1.0;
-    for (int d : A.shape()) total *= d;
-    std::cout << "[load] " << name
-              << " finites=" << nfin.item<float>() << "/" << total
-              << " nan=" << nnan.item<float>() << " inf=" << ninf.item<float>()
-              << " min=" << mn.item<float>() << " max=" << mx.item<float>() << "\n";
-  };
+  constexpr bool k_downcast_to_compute = true; // cast tensors to kComputeDType
+  constexpr int  k_q_group = 64;
+  const std::string k_q_mode = "affine";
 
   auto finalize_linear = [&](array a, bool transpose_linear) {
     if (transpose_linear && a.ndim() == 2) {
@@ -355,8 +345,7 @@ inline LlamaWeights load_llama_weights_from_torch(const std::string& path,
     } else {
       a = contiguous(a);
     }
-    if (k_downcast_to_f16) a = astype(a, float16);
-    return a;
+    return a; // keep dtype; caller may cast to compute dtype
   };
 
   // --- Read file and pickle_load ---
@@ -395,8 +384,7 @@ inline LlamaWeights load_llama_weights_from_torch(const std::string& path,
 
   // --- Robust loader: CPU F32 -> MLX-owned F32 ---
   auto load_f32_owned = [&](const torch::Tensor& tin,
-                            bool transpose_linear = false,
-                            const char* dbg_name = "tensor") -> array {
+                            bool transpose_linear = false) -> array {
     torch::Tensor t = tin.to(torch::kCPU, /*non_blocking=*/false);
     if (t.scalar_type() != torch::kFloat32) t = t.to(torch::kFloat32);
     t = t.contiguous();
@@ -407,9 +395,53 @@ inline LlamaWeights load_llama_weights_from_torch(const std::string& path,
 
     array a(host.begin(), shp, float32);
     a = finalize_linear(std::move(a), transpose_linear);
-
-    dbg_stats(dbg_name, a);
+    if (k_downcast_to_compute) a = astype(a, to_mlx_dtype(kComputeDType));
     return a;
+  };
+
+  // Helper: cast-and-quantize an MLX array into Q4Linear slot
+  auto make_q4_from_array = [&](const array& A_fp,
+                                Q4Linear& slot) {
+    if (!kUseQuantizedMatMul) return;
+    std::vector<array> q = quantize(A_fp, /*group_size=*/k_q_group, /*bits=*/4, /*mode=*/k_q_mode, {});
+    if (q.size() < 2) return; // defensive
+    array qw = ::mlx::core::contiguous(q[0]);
+    array sc = ::mlx::core::contiguous(q[1]);
+
+    slot.w_q4      = C.add(std::move(qw));
+    slot.scales    = C.add(std::move(sc));
+
+    if (q.size() >= 3) {
+      array qb = ::mlx::core::contiguous(q[2]);
+      slot.biases = C.add(std::move(qb));
+    }
+
+    slot.transpose = false;            // already applied layout via finalize_linear
+    slot.group_size= k_q_group;
+    slot.mode      = k_q_mode;
+    slot.out_dtype = kComputeDType;    // outputs match global compute dtype
+  };
+
+  // Helper: cast-and-quantize an MLX array into Q4Embedding slot
+  auto make_qembed_from_array = [&](const array& A_fp,
+                                    Q4Embedding& slot) {
+    if (!kUseQuantizedEmbed) return;
+    std::vector<array> q = quantize(A_fp, /*group_size=*/k_q_group, /*bits=*/4, /*mode=*/k_q_mode, {});
+    if (q.size() < 2) return;
+    array qw = ::mlx::core::contiguous(q[0]);
+    array sc = ::mlx::core::contiguous(q[1]);
+
+    slot.table_q4 = C.add(std::move(qw));
+    slot.scales   = C.add(std::move(sc));
+
+    if (q.size() >= 3) {
+      array qb = ::mlx::core::contiguous(q[2]);
+      slot.biases = C.add(std::move(qb)); // "biases" matches mlx::dequantize signature
+    }
+
+    slot.group_size = k_q_group;
+    slot.mode       = k_q_mode;
+    slot.out_dtype  = kComputeDType;
   };
 
   // --- Build weights (HF-style names) ---
@@ -420,26 +452,53 @@ inline LlamaWeights load_llama_weights_from_torch(const std::string& path,
       (has_key("tok_embeddings.weight")   ? "tok_embeddings.weight"
                                           : "model.embed_tokens.weight");
 
-  // Embeddings
+  // Embeddings (determine downstream activation dtype)
   {
-    array E = load_f32_owned(getT(k_embed), /*transpose_linear=*/false, "tok_emb");
+    array E = load_f32_owned(getT(k_embed), /*transpose_linear=*/false); // [vocab, Dm]
     W.tok_emb = C.add(std::move(E));
+
+    // Prepare quantized embedding if enabled
+    if (kUseQuantizedEmbed) {
+      make_qembed_from_array(C.c_ref(W.tok_emb), W.tok_emb_q4);
+    }
   }
 
+  // lm_head: always prepare [Dm, vocab] for the projection path; keep tok_emb for Gather/QEMBED
   if (tie_lm_head_to_tok_emb) {
     W.lm_head = W.tok_emb;
+
+    // materialize a transposed, contiguous compute-dtype copy: [Dm, vocab]
+    array LT = ::mlx::core::contiguous(::mlx::core::transpose(C.c_ref(W.tok_emb), {1, 0}));
+    LT = ::mlx::core::astype(LT, to_mlx_dtype(kComputeDType));
+    W.lm_head_T = C.add(std::move(LT));
+
+    if (kUseQuantizedMatMul) {
+      make_q4_from_array(C.c_ref(W.lm_head_T), W.lm_head_q4);
+    }
   } else if (has_key("lm_head.weight")) {
-    array L = load_f32_owned(getT("lm_head.weight"), /*transpose_linear=*/true, "lm_head");
-    W.lm_head = C.add(std::move(L));
+    // most checkpoints store as [vocab, Dm]; loader with transpose_linear=true → [Dm, vocab]
+    array L = load_f32_owned(getT("lm_head.weight"), /*transpose_linear=*/true);
+    W.lm_head_T = C.add(std::move(L));
+    if (kUseQuantizedMatMul) {
+      make_q4_from_array(C.c_ref(W.lm_head_T), W.lm_head_q4);
+    }
+    W.lm_head = W.tok_emb; // not used directly, parity only
   } else {
-    W.lm_head = W.tok_emb;
+    // fallback to tied if head missing
+    W.lm_head   = W.tok_emb;
+    array LT = ::mlx::core::contiguous(::mlx::core::transpose(C.c_ref(W.tok_emb), {1, 0}));
+    LT = ::mlx::core::astype(LT, to_mlx_dtype(kComputeDType));
+    W.lm_head_T = C.add(std::move(LT));
+    if (kUseQuantizedMatMul) {
+      make_q4_from_array(C.c_ref(W.lm_head_T), W.lm_head_q4);
+    }
   }
 
   const std::string k_final_norm =
       has_key("model.norm.weight") ? "model.norm.weight" :
       (has_key("norm.weight")      ? "norm.weight"      : "model.norm.weight");
   {
-    array nrm = load_f32_owned(getT(k_final_norm), /*transpose_linear=*/false, "final_norm");
+    array nrm = load_f32_owned(getT(k_final_norm), /*transpose_linear=*/false);
     W.w_rms_final = C.add(std::move(nrm));
   }
 
@@ -449,28 +508,49 @@ inline LlamaWeights load_llama_weights_from_torch(const std::string& path,
     auto& Lw = W.layers[l];
 
     // norms
-    Lw.w_rms_attn = C.add(load_f32_owned(getT(p + "input_layernorm.weight"), false,
-                                         ("L"+std::to_string(l)+"_rms_attn").c_str()));
-    Lw.w_rms_mlp  = C.add(load_f32_owned(getT(p + "post_attention_layernorm.weight"), false,
-                                         ("L"+std::to_string(l)+"_rms_mlp").c_str()));
+    {
+      array wa = load_f32_owned(getT(p + "input_layernorm.weight"), false);
+      array wm = load_f32_owned(getT(p + "post_attention_layernorm.weight"), false);
+      Lw.w_rms_attn = C.add(std::move(wa));
+      Lw.w_rms_mlp  = C.add(std::move(wm));
+    }
 
     // attention
-    Lw.Wq = C.add(load_f32_owned(getT(p + "self_attn.q_proj.weight"), true,
-                                 ("L"+std::to_string(l)+"_Wq").c_str()));
-    Lw.Wk = C.add(load_f32_owned(getT(p + "self_attn.k_proj.weight"), true,
-                                 ("L"+std::to_string(l)+"_Wk").c_str()));
-    Lw.Wv = C.add(load_f32_owned(getT(p + "self_attn.v_proj.weight"), true,
-                                 ("L"+std::to_string(l)+"_Wv").c_str()));
-    Lw.Wo = C.add(load_f32_owned(getT(p + "self_attn.o_proj.weight"), true,
-                                 ("L"+std::to_string(l)+"_Wo").c_str()));
+    {
+      array Wq = load_f32_owned(getT(p + "self_attn.q_proj.weight"), true);
+      array Wk = load_f32_owned(getT(p + "self_attn.k_proj.weight"), true);
+      array Wv = load_f32_owned(getT(p + "self_attn.v_proj.weight"), true);
+      array Wo = load_f32_owned(getT(p + "self_attn.o_proj.weight"), true);
+
+      if (kUseQuantizedMatMul) {
+        make_q4_from_array(Wq, Lw.Wq_q4);
+        make_q4_from_array(Wk, Lw.Wk_q4);
+        make_q4_from_array(Wv, Lw.Wv_q4);
+        make_q4_from_array(Wo, Lw.Wo_q4);
+      }
+
+      Lw.Wq = C.add(std::move(Wq));
+      Lw.Wk = C.add(std::move(Wk));
+      Lw.Wv = C.add(std::move(Wv));
+      Lw.Wo = C.add(std::move(Wo));
+    }
 
     // mlp
-    Lw.W_gate = C.add(load_f32_owned(getT(p + "mlp.gate_proj.weight"), true,
-                                     ("L"+std::to_string(l)+"_Wgate").c_str()));
-    Lw.W_up   = C.add(load_f32_owned(getT(p + "mlp.up_proj.weight"),   true,
-                                     ("L"+std::to_string(l)+"_Wup").c_str()));
-    Lw.W_down = C.add(load_f32_owned(getT(p + "mlp.down_proj.weight"), true,
-                                     ("L"+std::to_string(l)+"_Wdown").c_str()));
+    {
+      array Wg = load_f32_owned(getT(p + "mlp.gate_proj.weight"), true);
+      array Wu = load_f32_owned(getT(p + "mlp.up_proj.weight"),   true);
+      array Wd = load_f32_owned(getT(p + "mlp.down_proj.weight"), true);
+
+      if (kUseQuantizedMatMul) {
+        make_q4_from_array(Wg, Lw.W_gate_q4);
+        make_q4_from_array(Wu, Lw.W_up_q4);
+        make_q4_from_array(Wd, Lw.W_down_q4);
+      }
+
+      Lw.W_gate = C.add(std::move(Wg));
+      Lw.W_up   = C.add(std::move(Wu));
+      Lw.W_down = C.add(std::move(Wd));
+    }
   }
 
   return W;
@@ -486,11 +566,12 @@ inline void init_llama_cache_state(MutableData& st, const LlamaCfg& cfg, const L
   const int Tm  = cfg.T_max;
   const int Dh  = cfg.D_head;
 
+  auto kv_dt = to_mlx_dtype(kComputeDType);
+
   for (int l = 0; l < cfg.n_layers; ++l) {
     const auto& ids = Cc.layer_cache[l];
-    // Float32 for bring-up stability; switch to bfloat16 once verified
-    st.set_mutable_id(ids.K_cache, zeros(Shape{B, Hkv, Tm, Dh}, float32));
-    st.set_mutable_id(ids.V_cache, zeros(Shape{B, Hkv, Tm, Dh}, float32));
+    st.set_mutable_id(ids.K_cache, zeros(Shape{B, Hkv, Tm, Dh}, kv_dt));
+    st.set_mutable_id(ids.V_cache, zeros(Shape{B, Hkv, Tm, Dh}, kv_dt));
   }
 
   const auto& shared = Cc.layer_cache[0];
@@ -509,6 +590,30 @@ inline Mid add_rmsnorm(Program& prog, Tid x, Cid w, Mid out, float eps=1e-6f) {
   RMSNormNode n; n.x = x; n.weight = Tid{w}; n.out = out; n.eps = eps;
   prog.code.push_back(make_RMS_NORM(std::move(n)));
   return out;
+}
+
+// Q4-aware embeddings (QEMBED4 fallback to GATHER)
+inline Mid add_embeddings_qaware(Program& prog,
+                                 Cid emb_fp,                // [vocab, Dm]
+                                 const Q4Embedding& qemb,   // quant meta
+                                 Mid input_ids,             // [B,T] i32
+                                 Mid out_BTDm) {            // [B,T,Dm]
+  if (kUseQuantizedEmbed && qemb.valid()) {
+    QEmbed4Node n;
+    n.table_q4  = *qemb.table_q4;
+    n.scales    = *qemb.scales;
+    if (qemb.biases) n.biases = *qemb.biases;
+    n.group_size= qemb.group_size;
+    n.mode      = qemb.mode;
+    n.out_dtype = qemb.out_dtype;
+    n.ids       = Tid{input_ids};
+    n.out       = out_BTDm;
+    prog.code.push_back(make_QEMBED4(std::move(n)));
+  } else {
+    GatherNode g; g.table = Tid{emb_fp}; g.ids = Tid{input_ids}; g.out = out_BTDm;
+    prog.code.push_back(make_GATHER(std::move(g)));
+  }
+  return out_BTDm;
 }
 
 inline Mid add_embeddings(Program& prog, Cid emb, Mid input_ids, Mid out_BTDm) {
@@ -535,70 +640,97 @@ inline Mid add_add(Program& prog, Tid a, Tid b, Mid out) {
 }
 
 // -----------------------------------------------------
-// One transformer layer (T-agnostic). RoPE uses pos_id.
+// One transformer layer (T-agnostic). RoPE uses pos_id. (Pooled temps)
 // -----------------------------------------------------
 inline Mid add_llama_layer(Program& prog,
+                           MidPool& pool,
                            const LlamaCfg& cfg, const LlamaLayerWeights& W,
                            const CacheIds& cache, I32Id pos_id,
-                           Tid x_in_BTDm, Mid x_out_BTDm,
-                           int base_mid) {
-  const int B=cfg.B, H=cfg.H, Hkv=cfg.H_kv, Dh=cfg.D_head, Dm=cfg.D_model;
+                           Tid x_in_BTDm, Mid x_out_BTDm) {
+  const int B=cfg.B, H=cfg.H, Hkv=cfg.H_kv, Dh=cfg.D_head;
 
   // Attn RMSNorm
-  Mid x_norm{static_cast<uint32_t>(base_mid+0)};
+  Mid x_norm = pool.acquire();
   add_rmsnorm(prog, x_in_BTDm, W.w_rms_attn, x_norm, cfg.rms_eps);
 
-  // Q/K/V → packed heads (T inferred). Q uses H, K/V use Hkv.
-  Mid q_proj{static_cast<uint32_t>(base_mid+1)}, k_proj{static_cast<uint32_t>(base_mid+2)}, v_proj{static_cast<uint32_t>(base_mid+3)};
-  Mid q_BTHDh{static_cast<uint32_t>(base_mid+4)}, k_BTHDh{static_cast<uint32_t>(base_mid+5)}, v_BTHDh{static_cast<uint32_t>(base_mid+6)};
-  Mid Q{static_cast<uint32_t>(base_mid+7)}, K{static_cast<uint32_t>(base_mid+8)}, V{static_cast<uint32_t>(base_mid+9)};
+  // Q/K/V projections (packed heads)
+  Mid Q = pool.acquire();
+  Mid K = pool.acquire();
+  Mid V = pool.acquire();
 
-  add_project_and_pack_heads(prog, Tid{x_norm}, W.Wq, std::nullopt, B, H,   Dh, q_proj, q_BTHDh, Q);
-  add_project_and_pack_heads(prog, Tid{x_norm}, W.Wk, std::nullopt, B, Hkv, Dh, k_proj, k_BTHDh, K);
-  add_project_and_pack_heads(prog, Tid{x_norm}, W.Wv, std::nullopt, B, Hkv, Dh, v_proj, v_BTHDh, V);
+  add_project_and_pack_heads_pooled(prog, pool, Tid{x_norm}, W.Wq, std::nullopt, B, H,   Dh, Q, W.Wq_q4);
+  add_project_and_pack_heads_pooled(prog, pool, Tid{x_norm}, W.Wk, std::nullopt, B, Hkv, Dh, K, W.Wk_q4);
+  add_project_and_pack_heads_pooled(prog, pool, Tid{x_norm}, W.Wv, std::nullopt, B, Hkv, Dh, V, W.Wv_q4);
 
-  // RoPE (runtime offset)
-  Mid Qr{static_cast<uint32_t>(base_mid+10)}, Kr{static_cast<uint32_t>(base_mid+11)};
+  pool.release(x_norm);
+
+  // RoPE (Qr, Kr) replace Q/K then free Q/K
+  Mid Qr = pool.acquire();
+  Mid Kr = pool.acquire();
   const int rope_d = (cfg.rope_dims > 0 ? cfg.rope_dims : Dh);
   add_rope_qk(prog, Tid{Q}, Tid{K}, rope_d, pos_id, Qr, Kr,
               cfg.rope_traditional, cfg.rope_theta, /*scale=*/1.0f);
+  pool.release(Q);
+  pool.release(K);
 
   // KV cache write + read window
   add_kv_slice_update(prog, cache, Tid{Kr}, Tid{V});
-  Mid Kwin{static_cast<uint32_t>(base_mid+12)}, Vwin{static_cast<uint32_t>(base_mid+13)};
+  Mid Kwin = pool.acquire();
+  Mid Vwin = pool.acquire();
   add_kv_read_window(prog, cache, Kwin, Vwin);
+  pool.release(Kr);
+  pool.release(V);
 
-  // SDPA → [B,H,T,Dh] with GQA (Q: H, K/V: Hkv) + causal mask
-  Mid Attn_BHTDh{static_cast<uint32_t>(base_mid+14)};
+  // SDPA → [B,H,T,Dh] with GQA + causal mask
+  Mid Attn_BHTDh = pool.acquire();
   add_sdpa(prog, Tid{Qr}, Tid{Kwin}, Tid{Vwin},
            1.0f / std::sqrt((float)Dh),
            /*mask=*/std::nullopt,
            /*out=*/Attn_BHTDh,
            /*causal=*/true);
+  pool.release(Qr);
+  pool.release(Kwin);
+  pool.release(Vwin);
 
-  // Output projection back to [B,T,Dm] (T inferred)
-  Mid tmp_BTHDh{static_cast<uint32_t>(base_mid+15)}, tmp_BTHDm{static_cast<uint32_t>(base_mid+16)}, Attn_BTDm{static_cast<uint32_t>(base_mid+17)};
-  add_output_projection(prog, Tid{Attn_BHTDh}, W.Wo, std::nullopt, B, H, Dh, Dm, tmp_BTHDh, tmp_BTHDm, Attn_BTDm);
+  // Output projection back to [B,T,Dm]
+  Mid Attn_BTDm = pool.acquire();
+  add_output_projection_pooled(prog, pool, Tid{Attn_BHTDh}, W.Wo, std::nullopt,
+                               B, H, Dh, /*Dm=*/cfg.D_model, Attn_BTDm, W.Wo_q4);
+  pool.release(Attn_BHTDh);
 
   // Residual add1
-  Mid x_res1{static_cast<uint32_t>(base_mid+18)};
+  Mid x_res1 = pool.acquire();
   add_add(prog, x_in_BTDm, Tid{Attn_BTDm}, x_res1);
+  pool.release(Attn_BTDm);
 
   // MLP: RMSNorm → (SiLU(Wg*x)) ⊙ (Wu*x) → Wdown
-  Mid x_mlp_norm{static_cast<uint32_t>(base_mid+19)};
+  Mid x_mlp_norm = pool.acquire();
   add_rmsnorm(prog, Tid{x_res1}, W.w_rms_mlp, x_mlp_norm, cfg.rms_eps);
 
-  Mid gate{static_cast<uint32_t>(base_mid+20)}, up{static_cast<uint32_t>(base_mid+21)}, gate_act{static_cast<uint32_t>(base_mid+22)}, prod{static_cast<uint32_t>(base_mid+23)};
-  add_linear(prog, Tid{x_mlp_norm}, W.W_gate, std::nullopt, gate);     // [B,T,Dff]
-  add_linear(prog, Tid{x_mlp_norm}, W.W_up,   std::nullopt, up);       // [B,T,Dff]
-  add_silu  (prog, Tid{gate}, gate_act);
-  add_mul   (prog, Tid{gate_act}, Tid{up}, prod);
+  Mid gate = pool.acquire();
+  Mid up   = pool.acquire();
+  add_linear_qaware(prog, Tid{x_mlp_norm}, W.W_gate, std::nullopt, W.W_gate_q4, gate);
+  add_linear_qaware(prog, Tid{x_mlp_norm}, W.W_up,   std::nullopt, W.W_up_q4,   up);
+  pool.release(x_mlp_norm);
 
-  Mid mlp_out{static_cast<uint32_t>(base_mid+24)};
-  add_linear(prog, Tid{prod}, W.W_down, std::nullopt, mlp_out);        // [B,T,Dm]
+  Mid gate_act = pool.acquire();
+  add_silu(prog, Tid{gate}, gate_act);
+  pool.release(gate);
+
+  Mid prod = pool.acquire();
+  add_mul(prog, Tid{gate_act}, Tid{up}, prod);
+  pool.release(gate_act);
+  pool.release(up);
+
+  Mid mlp_out = pool.acquire();
+  add_linear_qaware(prog, Tid{prod}, W.W_down, std::nullopt, W.W_down_q4, mlp_out);
+  pool.release(prod);
 
   // Residual add2 → x_out
   add_add(prog, Tid{x_res1}, Tid{mlp_out}, x_out_BTDm);
+  pool.release(x_res1);
+  pool.release(mlp_out);
+
   return x_out_BTDm;
 }
 
@@ -611,46 +743,43 @@ struct LlamaGraph {
 };
 
 // -----------------------------------------------------
-// Build ONE shared LLaMA graph (no KV allocation ops).
-// T inferred from input_ids each run.
+// Build ONE shared LLaMA graph (no KV allocation ops). T inferred.
 // -----------------------------------------------------
 inline LlamaGraph build_llama_shared(Program& prog,
                                      const LlamaCfg& cfg,
                                      const LlamaWeights& W,
                                      const LlamaCaches& Cc,
-                                     Mid input_ids,  // provided by caller
-                                     Mid logits,     // provided by caller
+                                     Mid input_ids,
+                                     Mid logits,
                                      int base_mid=50000) {
+  (void)Cc; // used indirectly via layer calls
   LlamaGraph G;
   G.input_ids = input_ids;
   G.X_embed   = Mid{static_cast<uint32_t>(base_mid+9000)};
   G.X         = Mid{static_cast<uint32_t>(base_mid+9001)};
   G.logits    = logits;
 
-  // Embedding + contiguous
-  add_embeddings(prog, W.tok_emb, G.input_ids, G.X_embed);
+  // Embedding (Q4 if available) + contiguous (drop if not needed)
+  add_embeddings_qaware(prog, W.tok_emb, W.tok_emb_q4, G.input_ids, G.X_embed);
   { ContigNode c; c.x = Tid{G.X_embed}; c.out = G.X; prog.code.push_back(make_CONTIGUOUS(std::move(c))); }
 
-  // Layers (T-agnostic)
-  int layer_base = base_mid + 100000;
+  // Layers (each gets its own temp pool window)
+  const uint32_t LAYER_BASE = base_mid + 100000;
+  const uint32_t POOL_CAP   = 64;   // plenty for one layer
   for (int l=0; l<cfg.n_layers; ++l) {
-    Mid X_next{static_cast<uint32_t>(layer_base + l*1000 + 1)};
-    add_llama_layer(prog, cfg, W.layers[l], Cc.layer_cache[l], Cc.layer_cache[l].cursor,
-                    Tid{G.X}, X_next, /*base_mid=*/layer_base + l*1000 + 100);
+    MidPool layer_pool(/*base=*/LAYER_BASE + l*1000, /*cap=*/POOL_CAP);
+    Mid X_next{static_cast<uint32_t>(LAYER_BASE + l*1000 + 900)}; // persistent dest
+    add_llama_layer(prog, layer_pool, cfg, W.layers[l], Cc.layer_cache[l], Cc.layer_cache[l].cursor,
+                    Tid{G.X}, X_next);
     G.X = X_next;
   }
 
-  // Final RMSNorm + tied LM head: logits = X_norm @ tok_emb^T
-  Mid X_norm{static_cast<uint32_t>(base_mid+9100)};
+  // Tail: norm + logits (two temps max → tiny pool)
+  MidPool tail_pool(base_mid + 200000, 8);
+  Mid X_norm = tail_pool.acquire();
   add_rmsnorm(prog, Tid{G.X}, W.w_rms_final, X_norm, cfg.rms_eps);
-
-  MatmulNode mm;
-  mm.a  = Tid{X_norm};     // [B,T,Dm]
-  mm.b  = Tid{W.tok_emb};  // [vocab,Dm]
-  mm.ta = false;
-  mm.tb = true;            // transpose -> [Dm,vocab]
-  mm.out = G.logits;       // [B,T,vocab]
-  prog.code.push_back(make_MATMUL(std::move(mm)));
+  add_linear_qaware(prog, Tid{X_norm}, W.lm_head_T, std::nullopt, W.lm_head_q4, G.logits);
+  tail_pool.release(X_norm);
 
   return G;
 }
@@ -658,6 +787,28 @@ inline LlamaGraph build_llama_shared(Program& prog,
 // -----------------------------------------------------
 // Shared-cursor helpers (operate on the shared layer 0 IDs).
 // -----------------------------------------------------
+inline void set_prefill_cursor_and_shapes(MutableData& st, int B,int H,int Dh, int T_written,
+                                          const CacheIds& c) {
+  st.set_i32_id(c.cursor, 0);
+
+  st.set_shape_id(c.sh_strides, {1,1,1,1});
+  st.set_shape_id(c.sh_start,   {0,0,0,0});
+  st.set_shape_id(c.sh_stop,    {B,H,T_written,Dh});
+
+  st.set_shape_id(c.sh_kv_read_start, {0,0,0,0});
+  st.set_shape_id(c.sh_kv_read_stop,  {B,H,T_written,Dh});
+}
+
+inline void advance_decode_cursor(MutableData& st, int B,int H,int Dh,
+                                  const CacheIds& c, int cursor, int t_step) {
+  const int new_cursor = cursor + t_step;
+  st.set_i32_id(c.cursor, new_cursor);
+  st.set_shape_id(c.sh_start, {0,0,cursor,0});
+  st.set_shape_id(c.sh_stop,  {B,H,new_cursor,Dh});
+  st.set_shape_id(c.sh_kv_read_start, {0,0,0,0});
+  st.set_shape_id(c.sh_kv_read_stop,  {B,H,new_cursor,Dh});
+}
+
 inline void set_prefill_cursor_shared(MutableData& st,
                                       const LlamaCfg& cfg,
                                       const LlamaCaches& Cc,

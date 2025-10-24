@@ -57,5 +57,5 @@ cmake --build "$BUILD_DIR" --target "$RUN_TARGET" -j"$(sysctl -n hw.ncpu)"
 echo "[+] Running executable..."
 PROMPT_IDS=/Users/scroy/Desktop/mlx-demo/prompt_ids.txt \
 MODEL_PT=/Users/scroy/Desktop/mlx-demo/model.pt \
-MAX_NEW_TOKENS=64 \
+MAX_NEW_TOKENS=256 \
 "$BUILD_DIR/$RUN_TARGET"
