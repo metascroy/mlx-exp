@@ -1,4 +1,4 @@
-// program.hpp
+// program.hpp — refined Tid/Vid design with input/output maps
 #pragma once
 #include "ops.hpp"
 #include <memory>
@@ -13,197 +13,200 @@
 
 #include <mlx/array.h>
 #include <mlx/ops.h>
-#include <iostream> // @nocommit
 
 namespace executorch::mlx {
 
-// ---------------------------------------------
+  // ============================================================================
 // Core aliases
-// ---------------------------------------------
+// ============================================================================
 using Tensor = ::mlx::core::array;
-using Scalar = std::variant<int32_t, float, bool>;   // only for non-constants
+using Value  = std::variant<int32_t, float, bool>;
 
-enum class SlotKind : uint8_t { Tensor, Scalar };
-
-struct SlotMeta {
-  SlotKind                   kind{SlotKind::Tensor};
-  std::optional<std::string> name; // optional; empty = unnamed
+// ============================================================================
+// Tensor metadata (optional per tensor)
+// ============================================================================
+struct TensorMeta {
+  std::vector<int> shape;
+  std::vector<int> dim_order;
+  DTypeId dtype;
 };
 
-// ---------------------------------------------
-// Program: immutable artifact (code + constants + meta)
-// ---------------------------------------------
+
+// ============================================================================
+// ConstantData — immutable storage for constants
+// ============================================================================
+struct ConstantData {
+  std::vector<Tensor> tensors;
+
+  inline const Tensor& const_tensor_ref(Tid id) const {
+    if (id.idx >= tensors.size())
+      throw std::out_of_range("ConstantData::const_tensor_ref: id out of range");
+    return tensors[id.idx];
+  }
+
+  inline void add(Tensor t) { tensors.push_back(std::move(t)); }
+};
+
+// ============================================================================
+// Program — immutable artifact (code + layout + meta)
+// ============================================================================
 struct Program {
   std::vector<Instr> code;
 
-  // ---- Slot layout (contiguous ranges) ----
-  uint32_t num_constants        = 0;  // tensors only
-  uint32_t num_inputs           = 0;
-  uint32_t num_outputs          = 0;
-  uint32_t num_mutable_buffers  = 0;
-  uint32_t num_temps            = 0;
+  // ---- Tensor layout ----
+  uint32_t num_constant_tensors = 0;
+  uint32_t num_non_constant_tensors = 0;
+  uint32_t num_non_constant_values = 0;
 
-  inline uint32_t constants_begin() const { return 0; }
-  inline uint32_t inputs_begin()    const { return num_constants; }
-  inline uint32_t outputs_begin()   const { return num_constants + num_inputs; }
-  inline uint32_t mbufs_begin()     const { return num_constants + num_inputs + num_outputs; }
-  inline uint32_t temps_begin()     const { return num_constants + num_inputs + num_outputs + num_mutable_buffers; }
-  inline uint32_t total_slots()     const {
-    return num_constants + num_inputs + num_outputs + num_mutable_buffers + num_temps;
+  inline uint32_t num_tensors() const { return num_constant_tensors + num_non_constant_tensors; }
+  inline uint32_t num_values() const { return num_non_constant_values;  }
+
+  inline bool is_constant_tensor(Tid id) const { return id.idx < num_constant_tensors; }
+
+  // ---- Tensor metadata ----
+  std::vector<std::optional<TensorMeta>> tensor_meta;
+
+  // ---- Constant data ----
+  const ConstantData* constants = nullptr;
+
+  // ---- Name → slot lookup ----
+  using SlotVariant = std::variant<
+      Tid,
+      Vid<int32_t>,
+      Vid<float>,
+      Vid<bool>,
+      Vid<std::string>>;
+
+  std::unordered_map<std::string, SlotVariant> nameToSlot;
+
+  // ---- Explicit I/O mappings ----
+  // Each entry corresponds to user-facing positional index 0..N-1
+  std::vector<SlotVariant> input_map;
+  std::vector<SlotVariant> output_map;
+  std::vector<SlotVariant> mutable_buffer_map;
+
+  // ---- Bind constants ----
+  inline void bind_constants(const ConstantData& data) {
+    if (data.tensors.size() != num_constant_tensors)
+      throw std::runtime_error("bind_constants: size mismatch");
+    constants = &data;
   }
 
-  // ---- Metadata: one entry per slot ----
-  std::vector<SlotMeta> meta; // size == total_slots()
-
-  // ---- Constants arena (read-only at runtime; tensors only) ----
-  std::vector<std::optional<Tensor>> C_tensors;
-
-  // Optional name -> Vid lookup
-  std::unordered_map<std::string, Vid> nameToVid;
-
-  // ----- Build / finalize helpers -----
-  inline void finalize_layout() {
-    const auto N = total_slots();
-    meta.resize(N);
-    C_tensors.resize(num_constants);
+  // ---- Bind names ----
+  inline void bind_name(Tid id, std::string name) {
+    if (id.idx >= num_tensors())
+      throw std::out_of_range("Program::bind_name: Tid out of range");
+    if (!nameToSlot.emplace(std::move(name), id).second)
+      throw std::runtime_error("Program::bind_name: duplicate name");
   }
 
-  inline void bind_name(Vid id, std::string n) {
-    if (id.idx >= meta.size()) throw std::runtime_error("Program::bind_name: id out of range");
-    auto [it, ok] = nameToVid.emplace(n, id);
-    if (!ok) throw std::runtime_error("Program::bind_name duplicate slot name: \"" + n + "\"");
-    meta[id.idx].name = std::move(n);
+  template <typename T>
+  inline void bind_name(Vid<T> id, std::string name) {
+    if (!nameToSlot.emplace(std::move(name), id).second)
+      throw std::runtime_error("Program::bind_name: duplicate name");
   }
 
-  inline Vid get_by_name(const std::string& name) const {
-    auto it = nameToVid.find(name);
-    if (it == nameToVid.end())
-      throw std::runtime_error("Program::get_by_name: unknown name \"" + name + "\"");
+  // ---- Lookup ----
+  inline SlotVariant get_slot(const std::string& name) const {
+    auto it = nameToSlot.find(name);
+    if (it == nameToSlot.end())
+      throw std::runtime_error("Program::get_slot: unknown name '" + name + "'");
     return it->second;
   }
 
-  // Range-based role checks
-  inline bool is_constant(Vid id) const { return id.idx < num_constants; }
-  inline bool is_input  (Vid id) const { return id.idx >= inputs_begin()  && id.idx < outputs_begin(); }
-  inline bool is_output (Vid id) const { return id.idx >= outputs_begin() && id.idx < mbufs_begin(); }
-  inline bool is_mbuf   (Vid id) const { return id.idx >= mbufs_begin()   && id.idx < temps_begin(); }
-  inline bool is_temp   (Vid id) const { return id.idx >= temps_begin()   && id.idx < total_slots(); }
+  // ---- I/O registration ----
+  inline void add_input(SlotVariant s)  { input_map.push_back(std::move(s)); }
+  inline void add_output(SlotVariant s) { output_map.push_back(std::move(s)); }
+  inline void add_mutable_buffer(SlotVariant s) { mutable_buffer_map.push_back(std::move(s)); }
+  
+  inline const auto& input_slot(size_t i) const { return input_map.at(i); }
+  inline const auto& output_slot(size_t i) const { return output_map.at(i); }
 
-  // Populate a constant tensor slot
-  inline void set_constant_tensor(Vid id, Tensor t) {
-    if (!is_constant(id)) throw std::runtime_error("set_constant_tensor: id not in constants range");
-    if (meta[id.idx].kind != SlotKind::Tensor)
-      throw std::runtime_error("set_constant_tensor: slot kind must be Tensor");
-    C_tensors[id.idx] = std::move(t);
-  }
+  inline size_t num_inputs() const  { return input_map.size(); }
+  inline size_t num_outputs() const { return output_map.size(); }
 };
 
-// ---------------------------------------------
-// ExecutionState: per-run mutable arena only
-// ---------------------------------------------
+// ============================================================================
+// ExecutionState — per-run mutable data
+// ============================================================================
 struct ExecutionState {
-  const Program* P = nullptr; // must be bound
+  const Program* P = nullptr;
 
-  std::vector<std::optional<Tensor>> tensors; // size == P->total_slots()
-  std::vector<std::optional<Scalar>> scalars; // size == P->total_slots()
+  std::vector<std::optional<Tensor>> tensors;
+  std::vector<std::optional<Value>>  values;
 
   inline void bind(const Program& prog) {
     P = &prog;
-    const auto N = P->total_slots();
-    tensors.assign(N, std::nullopt);
-    scalars.assign(N, std::nullopt);
+    tensors.assign(P->num_non_constant_tensors, std::nullopt);
+    values.assign(P->num_non_constant_values, std::nullopt);
   }
 
   // --------------------------
   // Tensor accessors
   // --------------------------
-  inline Tensor& tensor_ref(Vid id) {
-    if (!P) throw std::runtime_error("ExecutionState::tensor_ref (mut): Program not bound");
-    if (id.idx >= P->total_slots()) throw std::out_of_range("tensor_ref: id out of range");
-    if (P->meta[id.idx].kind != SlotKind::Tensor)
-      throw std::runtime_error("tensor_ref: slot is not a Tensor");
-    if (P->is_constant(id)) {
-      throw std::runtime_error("tensor_ref (mut): write to constant Tensor slot");
-    }
-
-    auto& opt = tensors[id.idx];
-    if (!opt) throw std::runtime_error("tensor_ref (mut): uninitialized Tensor idx=" + std::to_string(id.idx));
+  inline Tensor& tensor_ref(Tid id) {
+    if (!P) throw std::runtime_error("tensor_ref: Program not bound");
+    if (id.idx >= P->num_tensors()) throw std::out_of_range("tensor_ref: id out of range");
+    if (P->is_constant_tensor(id))
+      throw std::runtime_error("tensor_ref: cannot mutate constant tensor");
+    auto& opt = tensors[id.idx - P->num_constant_tensors];
+    if (!opt) throw std::runtime_error("tensor_ref: uninitialized tensor idx=" + std::to_string(id.idx));
     return *opt;
   }
 
-  inline const Tensor& tensor_ref(Vid id) const {
-    if (!P) throw std::runtime_error("ExecutionState::tensor_ref (const): Program not bound");
-    if (id.idx >= P->total_slots()) throw std::out_of_range("tensor_ref: id out of range");
-    if (P->meta[id.idx].kind != SlotKind::Tensor)
-      throw std::runtime_error("tensor_ref: slot is not a Tensor");
+  inline const Tensor& const_tensor_ref(Tid id) const {
+    if (!P) throw std::runtime_error("tensor_ref (const): Program not bound");
+    if (id.idx >= P->num_tensors()) throw std::out_of_range("tensor_ref: id out of range");
 
-    if (P->is_constant(id)) {
-      const auto& opt = P->C_tensors[id.idx];
-      if (!opt) throw std::runtime_error("tensor_ref (const): missing constant Tensor idx=" + std::to_string(id.idx));
-      return *opt;
-    } else {
-      const auto& opt = tensors[id.idx];
-      if (!opt) throw std::runtime_error("tensor_ref (const): uninitialized Tensor idx=" + std::to_string(id.idx));
-      return *opt;
+    if (P->is_constant_tensor(id)) {
+      if (!P->constants)
+        throw std::runtime_error("tensor_ref (const): constants not bound");
+      return P->constants->const_tensor_ref(id);
     }
+
+    const auto& opt = tensors[id.idx - P->num_constant_tensors];
+    if (!opt) throw std::runtime_error("tensor_ref (const): uninitialized tensor idx=" + std::to_string(id.idx));
+    return *opt;
   }
 
   // --------------------------
-  // Scalar accessors
+  // Value accessors
   // --------------------------
-  template <class T>
-  inline T& scalar_ref(Vid id) {
-    static_assert(std::is_same_v<T,int32_t> || std::is_same_v<T,float> || std::is_same_v<T,bool>,
-                  "scalar_ref<T>: supported types are int32_t, float, bool");
-    if (!P) throw std::runtime_error("ExecutionState::scalar_ref (mut): Program not bound");
-    if (id.idx >= P->total_slots()) throw std::out_of_range("scalar_ref: id out of range");
-    if (P->meta[id.idx].kind != SlotKind::Scalar)
-      throw std::runtime_error("scalar_ref: slot is not a Scalar");
-    if (P->is_constant(id))
-      throw std::runtime_error("scalar_ref (mut): constants cannot be Scalars");
-
-    auto& opt = scalars[id.idx];
-    if (!opt) throw std::runtime_error("scalar_ref (mut): uninitialized Scalar idx=" + std::to_string(id.idx));
+  template <typename T>
+  inline T& value_ref(Vid<T> id) {
+    if (!P) throw std::runtime_error("value_ref: Program not bound");
+    if (id.idx >= values.size()) throw std::out_of_range("value_ref: id out of range");
+    auto& opt = values[id.idx];
+    if (!opt) throw std::runtime_error("value_ref: uninitialized value idx=" + std::to_string(id.idx));
     return std::get<T>(*opt);
   }
 
-  template <class T>
-  inline const T& scalar_ref(Vid id) const {
-    static_assert(std::is_same_v<T,int32_t> || std::is_same_v<T,float> || std::is_same_v<T,bool>,
-                  "scalar_ref<T>: supported types are int32_t, float, bool");
-    if (!P) throw std::runtime_error("ExecutionState::scalar_ref (const): Program not bound");
-    if (id.idx >= P->total_slots()) throw std::out_of_range("scalar_ref: id out of range");
-    if (P->meta[id.idx].kind != SlotKind::Scalar)
-      throw std::runtime_error("scalar_ref: slot is not a Scalar");
-    if (P->is_constant(id))
-      throw std::runtime_error("scalar_ref (const): constants cannot be Scalars");
-
-    const auto& opt = scalars[id.idx];
-    if (!opt) throw std::runtime_error("scalar_ref (const): uninitialized Scalar idx=" + std::to_string(id.idx));
+  template <typename T>
+  inline const T& const_value_ref(Vid<T> id) const {
+    if (!P) throw std::runtime_error("value_ref (const): Program not bound");
+    if (id.idx >= values.size()) throw std::out_of_range("value_ref: id out of range");
+    const auto& opt = values[id.idx];
+    if (!opt) throw std::runtime_error("value_ref (const): uninitialized value idx=" + std::to_string(id.idx));
     return std::get<T>(*opt);
   }
 
   // --------------------------
-  // By-name variants
+  // Name-based access
   // --------------------------
   inline Tensor& tensor_ref(const std::string& name) {
-    auto id = P->get_by_name(name);
-    return tensor_ref(id);
-  }
-  inline const Tensor& tensor_ref(const std::string& name) const {
-    auto id = P->get_by_name(name);
-    return tensor_ref(id);
+    auto slot = P->get_slot(name);
+    return tensor_ref(std::get<Tid>(slot));
   }
 
-  template <class T>
-  inline T& scalar_ref(const std::string& name) {
-    auto id = P->get_by_name(name);
-    return scalar_ref<T>(id);
+  inline const Tensor& const_tensor_ref(const std::string& name) {
+    auto slot = P->get_slot(name);
+    return const_tensor_ref(std::get<Tid>(slot));
   }
-  template <class T>
-  inline const T& scalar_ref(const std::string& name) const {
-    auto id = P->get_by_name(name);
-    return scalar_ref<T>(id);
+
+  template <typename T>
+  inline T& value_ref(const std::string& name) {
+    auto slot = P->get_slot(name);
+    return value_ref<T>(std::get<Vid<T>>(slot));
   }
 };
 

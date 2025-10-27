@@ -40,6 +40,16 @@ static inline ::mlx::core::Dtype to_dtype(DTypeId d) {
   return ::mlx::core::float32;
 }
 
+// New: uniform way to write op outputs into ExecutionState
+static inline void set_output(ExecutionState& st, Tid out, ::mlx::core::array a) {
+  if (!st.P) throw std::runtime_error("set_output: Program not bound");
+  if (out.idx < st.P->num_constant_tensors)
+    throw std::runtime_error("set_output: cannot write to constant tensor");
+  const uint32_t off = out.idx - st.P->num_constant_tensors;
+  if (off >= st.tensors.size()) throw std::out_of_range("set_output: tensor idx out of range");
+  st.tensors[off] = std::move(a);
+}
+
 // Alias for brevity
 using StreamOrDevice = ::mlx::core::StreamOrDevice;
 
@@ -54,20 +64,19 @@ inline void do_linear(const Program&,
                       const LinearNode& n,
                       StreamOrDevice s) {
   using namespace ::mlx::core;
-  const ExecutionState& cst = state;
 
-  const array& X = cst.tensor_ref(n.x);
-  const array& W = cst.tensor_ref(n.weight);
+  const array& X = state.const_tensor_ref(n.x);
+  const array& W = state.const_tensor_ref(n.weight);
 
   auto WT = transpose(W, {1, 0}, s);
   array Y = matmul(X, WT, s);  // assume shapes already correct
 
   if (n.bias) {
-    array b = cst.tensor_ref(*n.bias);
+    array b = state.const_tensor_ref(*n.bias);
     Y = add(Y, b, s);
   }
 
-  state.tensors[n.out.idx] = std::move(Y);
+  set_output(state, n.out, std::move(Y));
 }
 
 // ----- RMSNorm -----
@@ -76,19 +85,18 @@ inline void do_rmsnorm(const Program&,
                        const RMSNormNode& n,
                        StreamOrDevice s) {
   using namespace ::mlx::core;
-  const ExecutionState& cst = state;
 
-  const array& x = cst.tensor_ref(n.x);
+  const array& x = state.const_tensor_ref(n.x);
   array mu2 = mean(square(x, s), /*axis=*/-1, /*keepdims=*/true);
   array y   = multiply(x, rsqrt(mu2 + n.eps, s), s);
 
-  array w = cst.tensor_ref(n.weight);
+  array w = state.const_tensor_ref(n.weight);
   if (w.ndim() == 1) {
     auto shp = x.shape();
     for (size_t i = 0; i + 1 < shp.size(); ++i) shp[i] = 1;
     w = reshape(w, shp);
   }
-  state.tensors[n.out.idx] = multiply(y, w, s);
+  set_output(state, n.out, multiply(y, w, s));
 }
 
 // ----- RoPE -----
@@ -97,20 +105,20 @@ inline void do_rope(const Program&,
                     const RopeNode& r,
                     StreamOrDevice s) {
   using namespace ::mlx::core;
-  const ExecutionState& cst = state;
 
-  const array& Q = cst.tensor_ref(r.q_in);
-  const array& K = cst.tensor_ref(r.k_in);
-  const int offset = cst.scalar_ref<int32_t>(r.pos);
+  const array& Q = state.const_tensor_ref(r.q_in);
+  const array& K = state.const_tensor_ref(r.k_in);
+  const int offset = state.value_ref<int32_t>(r.pos);
+  std::optional<array> freqs_arr = std::nullopt;
+  if (r.freqs) {
+    freqs_arr = state.const_tensor_ref(*r.freqs);
+  }
 
-  std::optional<array> freqs = std::nullopt;
-  if (r.freq) freqs = cst.tensor_ref(*r.freq);
+  array Qr = fast::rope(Q, r.head_dim, r.traditional, r.base, r.scale, offset, freqs_arr, s);
+  array Kr = fast::rope(K, r.head_dim, r.traditional, r.base, r.scale, offset, freqs_arr, s);
 
-  array Qr = fast::rope(Q, r.head_dim, r.traditional, r.base, r.scale, offset, freqs, s);
-  array Kr = fast::rope(K, r.head_dim, r.traditional, r.base, r.scale, offset, freqs, s);
-
-  state.tensors[r.q_out.idx] = std::move(Qr);
-  state.tensors[r.k_out.idx] = std::move(Kr);
+  set_output(state, r.q_out, std::move(Qr));
+  set_output(state, r.k_out, std::move(Kr));
 }
 
 // ----- SDPA -----
@@ -120,17 +128,16 @@ inline void do_sdpa_fused(const Program&,
                           StreamOrDevice s) {
   using namespace ::mlx::core;
 
-  const ExecutionState& cst = state;
-  array Q = cst.tensor_ref(sdp.q);
-  array K = cst.tensor_ref(sdp.k);
-  array V = cst.tensor_ref(sdp.v);
+  array Q = state.const_tensor_ref(sdp.q);
+  array K = state.const_tensor_ref(sdp.k);
+  array V = state.const_tensor_ref(sdp.v);
 
   std::string mask_mode = "";
   std::vector<array> mask_arrs;
   std::optional<array> sinks = std::nullopt;
 
   if (sdp.mask) {
-    array M = cst.tensor_ref(*sdp.mask);
+    array M = state.const_tensor_ref(*sdp.mask);
     if (M.dtype() != Q.dtype()) M = astype(M, Q.dtype(), s);
     mask_arrs.push_back(std::move(M));
   }
@@ -139,7 +146,7 @@ inline void do_sdpa_fused(const Program&,
   array out = fast::scaled_dot_product_attention(
       Q, K, V, static_cast<float>(sdp.scale), mask_mode, mask_arrs, sinks, s
   );
-  state.tensors[sdp.out.idx] = std::move(out);
+  set_output(state, sdp.out, std::move(out));
 }
 
 // ----- Slice (single-axis scalar Vids {axis,start,length}) -----
@@ -149,13 +156,17 @@ inline void do_slice(const Program&,
                      StreamOrDevice s) {
   using namespace ::mlx::core;
 
-  const ExecutionState& cst = state;
-  const array& x = cst.tensor_ref(n.x);
+  const array& x = state.const_tensor_ref(n.x);
 
   const int rank = static_cast<int>(x.ndim());
-  int axis  = cst.scalar_ref<int32_t>(n.axis);
-  int start = cst.scalar_ref<int32_t>(n.start);
-  int len   = cst.scalar_ref<int32_t>(n.length);
+  auto resolve = [&](const std::variant<int, Vid<int>>& v) -> int {
+    if (std::holds_alternative<int>(v)) return std::get<int>(v);
+    return state.value_ref<int32_t>(std::get<Vid<int>>(v));
+  };
+
+  int axis  = resolve(n.axis);
+  int start = resolve(n.start);
+  int len   = resolve(n.length);
 
   if (axis < 0) axis += rank;
   if (axis < 0 || axis >= rank) throw std::out_of_range("Slice: axis out of range");
@@ -163,11 +174,9 @@ inline void do_slice(const Program&,
 
   std::vector<int> vstart(rank, 0);
   std::vector<int> vstop;
-  {
-    vstop.reserve(rank);
-    auto sh = x.shape();
-    for (int i = 0; i < rank; ++i) vstop.push_back(static_cast<int>(sh[i]));
-  }
+  vstop.reserve(rank);
+  auto sh = x.shape();
+  for (int i = 0; i < rank; ++i) vstop.push_back(static_cast<int>(sh[i]));
 
   const int dim = vstop[axis];
   if (start < 0) start += dim;
@@ -177,7 +186,7 @@ inline void do_slice(const Program&,
   vstart[axis] = start;
   vstop[axis]  = stop;
 
-  state.tensors[n.out.idx] = slice(x, to_shape(vstart), to_shape(vstop), s);
+  set_output(state, n.out, slice(x, to_shape(vstart), to_shape(vstop), s));
 }
 
 // ----- SliceUpdate (single-axis scalar Vids {axis,start,length}) -----
@@ -188,13 +197,17 @@ inline void do_slice_update(const Program&,
   using namespace ::mlx::core;
 
   array& dst = state.tensor_ref(n.dst);
-  const ExecutionState& cst = state;
-  const array& upd = cst.tensor_ref(n.update);
+  const array& upd = state.const_tensor_ref(n.update);
 
   const int rank = static_cast<int>(dst.ndim());
-  int axis  = cst.scalar_ref<int32_t>(n.axis);
-  int start = cst.scalar_ref<int32_t>(n.start);
-  int len   = cst.scalar_ref<int32_t>(n.length);
+  auto resolve = [&](const std::variant<int, Vid<int>>& v) -> int {
+    if (std::holds_alternative<int>(v)) return std::get<int>(v);
+    return state.value_ref<int32_t>(std::get<Vid<int>>(v));
+  };
+
+  int axis  = resolve(n.axis);
+  int start = resolve(n.start);
+  int len   = resolve(n.length);
 
   if (axis < 0) axis += rank;
   if (axis < 0 || axis >= rank) throw std::out_of_range("SliceUpdate: axis out of range");
@@ -202,11 +215,9 @@ inline void do_slice_update(const Program&,
 
   std::vector<int> vstart(rank, 0);
   std::vector<int> vstop;
-  {
-    vstop.reserve(rank);
-    auto sh = dst.shape();
-    for (int i = 0; i < rank; ++i) vstop.push_back(static_cast<int>(sh[i]));
-  }
+  vstop.reserve(rank);
+  auto sh = dst.shape();
+  for (int i = 0; i < rank; ++i) vstop.push_back(static_cast<int>(sh[i]));
 
   const int dst_dim = vstop[axis];
   const int upd_dim = (axis < static_cast<int>(upd.ndim()))
@@ -230,13 +241,12 @@ inline void do_quantized_linear(const Program&,
                                 StreamOrDevice s) {
   using namespace ::mlx::core;
 
-  const ExecutionState& cst = state;
-  array X  = cst.tensor_ref(n.x);
-  array Wq = cst.tensor_ref(n.w);
-  array Sc = cst.tensor_ref(n.scales);
+  array X  = state.const_tensor_ref(n.x);
+  array Wq = state.const_tensor_ref(n.w);
+  array Sc = state.const_tensor_ref(n.scales);
 
   std::optional<array> Qb = std::nullopt;  // quantization biases (affine)
-  if (n.biases) Qb = cst.tensor_ref(*n.biases);
+  if (n.biases) Qb = state.const_tensor_ref(*n.biases);
 
   // No implicit transpose; weights provided in correct orientation.
   array Y = quantized_matmul(
@@ -253,7 +263,7 @@ inline void do_quantized_linear(const Program&,
 
   // Add neural bias (post-matmul) if present
   if (n.bias) {
-    array b = cst.tensor_ref(*n.bias);
+    array b = state.const_tensor_ref(*n.bias);
     if (b.ndim() == 1) {
       auto shp = Y.shape();
       for (size_t i = 0; i + 1 < shp.size(); ++i) shp[i] = 1;
@@ -265,7 +275,7 @@ inline void do_quantized_linear(const Program&,
   if (n.out_dtype != DTypeId::f32)
     Y = astype(Y, to_dtype(n.out_dtype), s);
 
-  state.tensors[n.out.idx] = std::move(Y);
+  set_output(state, n.out, std::move(Y));
 }
 
 // ----- Quantized Gather (no neural bias) -----
@@ -275,15 +285,14 @@ inline void do_quantized_gather(const Program&,
                                 StreamOrDevice s) {
   using namespace ::mlx::core;
 
-  const ExecutionState& cst = state;
-  array ids = cst.tensor_ref(n.ids);
+  array ids = state.const_tensor_ref(n.ids);
   if (ids.dtype() != int32) ids = astype(ids, int32, s);
 
-  array Wq = cst.tensor_ref(n.table_q);
-  array Sc = cst.tensor_ref(n.scales);
+  array Wq = state.const_tensor_ref(n.table_q);
+  array Sc = state.const_tensor_ref(n.scales);
 
   std::optional<array> Qb = std::nullopt;
-  if (n.biases) Qb = cst.tensor_ref(*n.biases);
+  if (n.biases) Qb = state.const_tensor_ref(*n.biases);
 
   array Wq_sel = take(Wq, ids, /*axis=*/0, s);
   array Sc_sel = take(Sc, ids, /*axis=*/0, s);
@@ -303,7 +312,7 @@ inline void do_quantized_gather(const Program&,
   if (n.out_dtype != DTypeId::f32)
     Y = astype(Y, to_dtype(n.out_dtype), s);
 
-  state.tensors[n.out.idx] = std::move(Y);
+  set_output(state, n.out, std::move(Y));
 }
 
 } // namespace impl
@@ -313,7 +322,7 @@ inline void do_quantized_gather(const Program&,
 // -----------------------------------------------------------------------------
 #define DECL_HANDLER(NAME, PAYLOAD) \
   static void op_##NAME(const Instr&, const Program&, ExecutionState&, StreamOrDevice);
-LLM_OP_LIST(DECL_HANDLER)
+OP_LIST(DECL_HANDLER)
 #undef DECL_HANDLER
 
 static void op_NOOP(const Instr&, const Program&, ExecutionState&, StreamOrDevice) {}
@@ -334,47 +343,40 @@ static void op_ROPE_APPLY(const Instr& ins, const Program& prog, ExecutionState&
 static void op_ADD(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<AddNode>();
-  const ExecutionState& cst = st;
-  st.tensors[n.out.idx] = add(cst.tensor_ref(n.a), cst.tensor_ref(n.b), s);
+  set_output(st, n.out, add(st.const_tensor_ref(n.a), st.const_tensor_ref(n.b), s));
 }
 static void op_MUL(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<MulNode>();
-  const ExecutionState& cst = st;
-  st.tensors[n.out.idx] = multiply(cst.tensor_ref(n.a), cst.tensor_ref(n.b), s);
+  set_output(st, n.out, multiply(st.const_tensor_ref(n.a), st.const_tensor_ref(n.b), s));
 }
 static void op_SILU(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<SiluNode>();
-  const ExecutionState& cst = st;
-  const auto& x = cst.tensor_ref(n.x);
-  st.tensors[n.out.idx] = multiply(x, sigmoid(x, s), s);
+  const auto& x = st.const_tensor_ref(n.x);
+  set_output(st, n.out, multiply(x, sigmoid(x, s), s));
 }
 
 static void op_RESHAPE(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice) {
   using namespace ::mlx::core;
   const auto& n = ins.get<ReshapeNode>();
-  const ExecutionState& cst = st;
-  st.tensors[n.out.idx] = reshape(cst.tensor_ref(n.x), to_shape(n.shape));
+  set_output(st, n.out, reshape(st.const_tensor_ref(n.x), to_shape(n.shape)));
 }
 static void op_TRANSPOSE(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<TransposeNode>();
-  const ExecutionState& cst = st;
-  st.tensors[n.out.idx] = transpose(cst.tensor_ref(n.x), n.perm, s);
+  set_output(st, n.out, transpose(st.const_tensor_ref(n.x), n.perm, s));
 }
 static void op_CONTIGUOUS(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<ContigNode>();
-  const ExecutionState& cst = st;
-  st.tensors[n.out.idx] = copy(cst.tensor_ref(n.x), s);
+  set_output(st, n.out, copy(st.const_tensor_ref(n.x), s));
 }
 
 static void op_GATHER(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<GatherNode>();
-  const ExecutionState& cst = st;
-  st.tensors[n.out.idx] = take(cst.tensor_ref(n.table), cst.tensor_ref(n.ids), /*axis=*/0, s);
+  set_output(st, n.out, take(st.const_tensor_ref(n.table), st.const_tensor_ref(n.ids), /*axis=*/0, s));
 }
 
 static void op_SLICE(const Instr& ins, const Program& prog, ExecutionState& st, StreamOrDevice s) {
@@ -384,40 +386,37 @@ static void op_SLICE(const Instr& ins, const Program& prog, ExecutionState& st, 
 static void op_CONCAT(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<ConcatNode>();
-  const ExecutionState& cst = st;
-  st.tensors[n.out.idx] = concatenate({ cst.tensor_ref(n.a), cst.tensor_ref(n.b) }, n.axis, s);
+  set_output(st, n.out, concatenate({ st.const_tensor_ref(n.a), st.const_tensor_ref(n.b) }, n.axis, s));
 }
 
 static void op_CAST(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<CastNode>();
-  const ExecutionState& cst = st;
-  st.tensors[n.out.idx] = astype(cst.tensor_ref(n.x), to_dtype(n.dtype), s);
+  set_output(st, n.out, astype(st.const_tensor_ref(n.x), to_dtype(n.dtype), s));
 }
 
 static void op_FULL(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<FullNode>();
-  st.tensors[n.out.idx] = full(to_shape(n.shape), n.v, to_dtype(n.dtype), s);
+  set_output(st, n.out, full(to_shape(n.shape), n.v, to_dtype(n.dtype), s));
 }
 static void op_ZEROS(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<ZerosNode>();
-  st.tensors[n.out.idx] = zeros(to_shape(n.shape), to_dtype(n.dtype), s);
+  set_output(st, n.out, zeros(to_shape(n.shape), to_dtype(n.dtype), s));
 }
 static void op_ONES(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<OnesNode>();
-  st.tensors[n.out.idx] = ones(to_shape(n.shape), to_dtype(n.dtype), s);
+  set_output(st, n.out, ones(to_shape(n.shape), to_dtype(n.dtype), s));
 }
 
 static void op_ARGMAX(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<ArgmaxNode>();
-  const ExecutionState& cst = st;
-  array idx = argmax(cst.tensor_ref(n.x), n.axis, s);
+  array idx = argmax(st.const_tensor_ref(n.x), n.axis, s);
   if (idx.dtype() != int32) idx = astype(idx, int32, s);
-  st.tensors[n.out.idx] = std::move(idx);
+  set_output(st, n.out, std::move(idx));
 }
 
 static void op_SLICE_UPDATE(const Instr& ins, const Program& prog, ExecutionState& st, StreamOrDevice s) {
@@ -438,7 +437,7 @@ using OpImplFn = void(*)(const Instr&, const Program&, ExecutionState&, StreamOr
 
 #define ADD_PTR(NAME, PAYLOAD) &op_##NAME,
 static constexpr std::array<OpImplFn, static_cast<size_t>(OpCode::SENTINEL)> kDispatch = {
-  LLM_OP_LIST(ADD_PTR)
+  OP_LIST(ADD_PTR)
 };
 #undef ADD_PTR
 
