@@ -1,4 +1,4 @@
-// main.cpp — sequential mbuf allocation (fixed KV write/read windows via scalar slice params)
+// main.cpp — name-bound initialization + refs
 #include "ops.hpp"
 #include "program.hpp"
 #include "interpreter.hpp"
@@ -54,7 +54,7 @@ static array sample_next_token(const array& logits) {
 
 int main() {
   try {
-    const std::string model_pt  = env_or("MODEL_PT",   "model.pt");
+    const std::string model_pt  = env_or("MODEL_PT",   "model.safetensors");
     const std::string prompt_fp = env_or("PROMPT_IDS", "prompt_ids.txt");
     const int max_new_tokens    = env_or_int("MAX_NEW_TOKENS", 64);
     const int print_batch       = std::max(1, env_or_int("PRINT_BATCH", 1));
@@ -69,27 +69,32 @@ int main() {
     cfg.rope_traditional=false; cfg.rope_theta=500000.f; cfg.rms_eps=1e-6f;
 
     Program P;
+    ConstantData consts;  // external constant storage
 
-    // 1) Load constants (bumps P.num_constants only)
-    auto W = load_llama_weights_from_torch(model_pt, P, cfg, /*tie_lm_head=*/true);
+    // 1) Load constants (fills consts; bumps P.num_constant_tensors; binds to Program)
+    auto W = load_llama_weights_from_torch(model_pt, P, consts, cfg, /*tie_lm_head=*/true);
 
-    // 2) Fix ranges and finalize once (inputs/outputs known; mbufs start empty)
-    P.num_inputs  = 1; // tokens
-    P.num_outputs = 1; // logits
-    P.num_mutable_buffers = 0; // we'll append mbufs sequentially
-    P.num_temps = 0;
-    P.finalize_layout(); // sizes meta & C_tensors (already filled), defines mbufs_begin()
+    // 2) Graph/caches (append non-constant slots: tensors + scalar values)
+    auto Cc = make_caches(P, cfg);
+    auto G  = make_graph_ids(P, cfg);
 
-    // 3) Append caches (mbufs) and graph scratch (mbufs)
-    auto Cc = make_caches(P, cfg);       // appends: cursor, scalar slice params, per-layer K/V
-    auto G  = make_graph_ids(P, cfg);    // appends: X_embed, X_stream, per-layer scratch, tail x_next
-
-    // Bind helpful names (optional)
+    // 3) Bind helpful names (for name-based access)
     P.bind_name(G.input_ids, "input_ids");
     P.bind_name(G.logits,    "logits");
     for (int l=0;l<cfg.n_layers;++l) {
       P.bind_name(Cc.by_layer[l].K_cache, "L"+std::to_string(l)+".K_cache");
       P.bind_name(Cc.by_layer[l].V_cache, "L"+std::to_string(l)+".V_cache");
+    }
+    // Bind shared scalar Vids (all layers share the same Vid ids)
+    {
+      const auto& c0 = Cc.by_layer[0];
+      P.bind_name(c0.cursor,   "cursor");
+      P.bind_name(c0.sh_axis,  "sh_axis");
+      P.bind_name(c0.sh_start, "sh_start");
+      P.bind_name(c0.sh_len,   "sh_len");
+      P.bind_name(c0.rd_axis,  "rd_axis");
+      P.bind_name(c0.rd_start, "rd_start");
+      P.bind_name(c0.rd_len,   "rd_len");
     }
 
     // 4) Emit instructions
@@ -98,37 +103,49 @@ int main() {
     // -------- Runtime state --------
     ExecutionState S; S.bind(P);
 
-    // Debug layout (optional)
-    std::cout << "constants: " << P.num_constants << "\n";
-    std::cout << "constants begin: " << P.constants_begin() << "\n";
-    std::cout << "inputs: " << P.num_inputs << "\n";
-    std::cout << "inputs begin: " << P.inputs_begin() << "\n";
-    std::cout << "outputs: " << P.num_outputs << "\n";
-    std::cout << "outputs begin: " << P.outputs_begin() << "\n";
-    std::cout << "mutable buffers: " << P.num_mutable_buffers << "\n";
-    std::cout << "mutable buffers begin: " << P.mbufs_begin() << "\n";
-    std::cout << "temps: " << P.num_temps << "\n";
-    std::cout << "temps begin: " << P.temps_begin() << "\n";
+    // Name-based initializers (initialize optionals safely by name)
+    auto set_tensor_by_name = [&](const std::string& name, array a) {
+      Tid id = std::get<Tid>(P.get_slot(name));
+      // non-constant tensors are stored after constants; ExecutionState stores only the non-constant block
+      size_t off = id.idx - P.num_constant_tensors;
+      if (off >= S.tensors.size()) throw std::out_of_range("set_tensor_by_name: offset out of range");
+      S.tensors[off] = std::move(a);
+    };
+    auto get_tensor_cref_by_name = [&](const std::string& name) -> const array& {
+      return S.const_tensor_ref(std::get<Tid>(P.get_slot(name)));
+    };
+    auto get_tensor_ref_by_name = [&](const std::string& name) -> array& {
+      return S.tensor_ref(std::get<Tid>(P.get_slot(name)));
+    };
+    auto set_value_by_name = [&](const std::string& name, int32_t v) {
+      auto id = std::get<Vid<int32_t>>(P.get_slot(name));
+      if (id.idx >= S.values.size()) throw std::out_of_range("set_value_by_name: id out of range");
+      S.values[id.idx] = Value{ v };
+    };
 
-    // Initialize KV caches + scalar slice helpers
+    // Debug layout
+    std::cout << "constant tensors: " << P.num_constant_tensors << "\n";
+    std::cout << "non-constant tensors: " << P.num_non_constant_tensors << "\n";
+    std::cout << "non-constant values: " << P.num_non_constant_values << "\n";
+    std::cout << "inputs: " << P.num_inputs() << ", outputs: " << P.num_outputs() << "\n";
+
+    // Initialize KV caches + scalar slice helpers using name-based initializers
     {
-      const Dtype act_dt = to_mlx(kComputeDT);
+      const Dtype act_dt = float32; // runtime dtype for cache buffers
       for (int l=0;l<cfg.n_layers;++l) {
-        const auto& c = Cc.by_layer[l];
-        S.tensors[c.K_cache.idx] = zeros(shape({cfg.B, cfg.H_kv, cfg.T_max, cfg.D_head}), act_dt);
-        S.tensors[c.V_cache.idx] = zeros(shape({cfg.B, cfg.H_kv, cfg.T_max, cfg.D_head}), act_dt);
+        set_tensor_by_name("L"+std::to_string(l)+".K_cache",
+          zeros(shape({cfg.B, cfg.H_kv, cfg.T_max, cfg.D_head}), act_dt));
+        set_tensor_by_name("L"+std::to_string(l)+".V_cache",
+          zeros(shape({cfg.B, cfg.H_kv, cfg.T_max, cfg.D_head}), act_dt));
       }
-      const auto& c0 = Cc.by_layer[0];
-      // cursor scalar
-      S.scalars[c0.cursor.idx] = Scalar{int32_t(0)};
-      // slice axis = time dim (2)
-      S.scalars[c0.sh_axis.idx] = Scalar{int32_t(2)};
-      S.scalars[c0.rd_axis.idx] = Scalar{int32_t(2)};
-      // initialize starts/lengths to zero; will set proper values before runs
-      S.scalars[c0.sh_start.idx] = Scalar{int32_t(0)};
-      S.scalars[c0.sh_len.idx]   = Scalar{int32_t(0)};
-      S.scalars[c0.rd_start.idx] = Scalar{int32_t(0)};
-      S.scalars[c0.rd_len.idx]   = Scalar{int32_t(0)};
+      // cursor and slice helpers (initialize values)
+      set_value_by_name("cursor",   0);
+      set_value_by_name("sh_axis",  2);
+      set_value_by_name("rd_axis",  2);
+      set_value_by_name("sh_start", 0);
+      set_value_by_name("sh_len",   0);
+      set_value_by_name("rd_start", 0);
+      set_value_by_name("rd_len",   0);
     }
 
     // -------- Prefill --------
@@ -137,31 +154,28 @@ int main() {
     if ((int)prompt.size() > cfg.T_max) throw std::runtime_error("prompt too long");
     const int T_prefill = (int)prompt.size();
 
-    // tokens → inputs range
+    // tokens → inputs tensor
     {
       array ids(prompt.data(), Shape{(int)prompt.size()}, int32);
       ids = reshape(ids, Shape{cfg.B, T_prefill});
-      S.tensors[G.input_ids.idx] = std::move(ids);
+      set_tensor_by_name("input_ids", std::move(ids));
     }
 
     // set cursor/slices for prefill: write/read [0, T_prefill)
     {
-      auto& c0 = Cc.by_layer[0];
-      S.scalars[c0.cursor.idx]   = Scalar{int32_t(0)};
-      S.scalars[c0.sh_start.idx] = Scalar{int32_t(0)};
-      S.scalars[c0.sh_len.idx]   = Scalar{int32_t(T_prefill)};
-      S.scalars[c0.rd_start.idx] = Scalar{int32_t(0)};
-      S.scalars[c0.rd_len.idx]   = Scalar{int32_t(T_prefill)};
+      set_value_by_name("cursor",   0);
+      set_value_by_name("sh_start", 0);
+      set_value_by_name("sh_len",   T_prefill);
+      set_value_by_name("rd_start", 0);
+      set_value_by_name("rd_len",   T_prefill);
     }
 
-    std::cout << "Defining interpreter…\n";
     Interpreter I;
 
     std::cout << "Running prefill on T=" << T_prefill << "…\n";
     auto t0p = std::chrono::steady_clock::now();
     I.run(P, S);
-    std::cout << "Done calling I.run()\n";
-    array next_ids = sample_next_token(S.tensor_ref(G.logits));
+    array next_ids = sample_next_token(get_tensor_cref_by_name("logits"));
     eval(next_ids);
     auto t1p = std::chrono::steady_clock::now();
     std::cout << "Prefill token: " << next_ids.item<int>() << "\n";
@@ -170,14 +184,13 @@ int main() {
 
     // -------- Seed decode slice helpers (write one step at T_prefill) --------
     {
-      auto& c0 = Cc.by_layer[0];
-      S.scalars[c0.cursor.idx]   = Scalar{int32_t(T_prefill)};
+      set_value_by_name("cursor",   T_prefill);
       // write exactly one new time index at `cursor`
-      S.scalars[c0.sh_start.idx] = Scalar{int32_t(T_prefill)};
-      S.scalars[c0.sh_len.idx]   = Scalar{int32_t(1)};
+      set_value_by_name("sh_start", T_prefill);
+      set_value_by_name("sh_len",   1);
       // read covers [0, T_prefill)
-      S.scalars[c0.rd_start.idx] = Scalar{int32_t(0)};
-      S.scalars[c0.rd_len.idx]   = Scalar{int32_t(T_prefill)};
+      set_value_by_name("rd_start", 0);
+      set_value_by_name("rd_len",   T_prefill);
     }
 
     // -------- Decode --------
@@ -190,22 +203,21 @@ int main() {
     std::vector<array> pending; pending.reserve(print_batch);
 
     for (int step=0; step<max_new_tokens; ++step) {
-      S.tensors[G.input_ids.idx] = cur_ids;
+      set_tensor_by_name("input_ids", cur_ids);
 
-      auto& c0 = Cc.by_layer[0];
       int new_cursor = cursor + 1;
 
-      S.scalars[c0.cursor.idx]   = Scalar{int32_t(cursor)};
+      set_value_by_name("cursor",   cursor);
       // Write [cursor, cursor+1)
-      S.scalars[c0.sh_start.idx] = Scalar{int32_t(cursor)};
-      S.scalars[c0.sh_len.idx]   = Scalar{int32_t(1)};
+      set_value_by_name("sh_start", cursor);
+      set_value_by_name("sh_len",   1);
       // Read [0, new_cursor)
-      S.scalars[c0.rd_start.idx] = Scalar{int32_t(0)};
-      S.scalars[c0.rd_len.idx]   = Scalar{int32_t(new_cursor)};
+      set_value_by_name("rd_start", 0);
+      set_value_by_name("rd_len",   new_cursor);
 
       I.run(P, S);
 
-      array next_ids2 = sample_next_token(S.tensor_ref(G.logits));
+      array next_ids2 = sample_next_token(get_tensor_cref_by_name("logits"));
       async_eval(next_ids2);
 
       pending.push_back(next_ids2);
@@ -245,7 +257,6 @@ int main() {
     double tps = printed.size() / std::max(ms/1000.0, 1e-9);
     std::cout << "Generated " << printed.size() << " tokens\n";
     std::cout << "Throughput: " << std::fixed << std::setprecision(2) << tps << " tok/s\n";
-
 
     std::cout << "Generated tokens: ";
     for (int t : printed) std::cout << t << ' ';
