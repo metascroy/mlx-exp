@@ -65,14 +65,15 @@ inline void do_linear(const Program&,
                       StreamOrDevice s) {
   using namespace ::mlx::core;
 
-  const array& X = state.const_tensor_ref(n.x);
-  const array& W = state.const_tensor_ref(n.weight);
+  const auto& X = state.const_tensor_ref(n.x);
 
-  auto WT = transpose(W, {1, 0}, s);
-  array Y = matmul(X, WT, s);  // assume shapes already correct
+  auto W = state.const_tensor_ref(n.weight);
+  W = transpose(W, {1, 0}, s);
+
+  array Y = matmul(X, W, s);  // assume shapes already correct
 
   if (n.bias) {
-    array b = state.const_tensor_ref(*n.bias);
+    const auto& b = state.const_tensor_ref(*n.bias);
     Y = add(Y, b, s);
   }
 
@@ -85,18 +86,9 @@ inline void do_rmsnorm(const Program&,
                        const RMSNormNode& n,
                        StreamOrDevice s) {
   using namespace ::mlx::core;
-
-  const array& x = state.const_tensor_ref(n.x);
-  array mu2 = mean(square(x, s), /*axis=*/-1, /*keepdims=*/true);
-  array y   = multiply(x, rsqrt(mu2 + n.eps, s), s);
-
-  array w = state.const_tensor_ref(n.weight);
-  if (w.ndim() == 1) {
-    auto shp = x.shape();
-    for (size_t i = 0; i + 1 < shp.size(); ++i) shp[i] = 1;
-    w = reshape(w, shp);
-  }
-  set_output(state, n.out, multiply(y, w, s));
+  const auto& x = state.const_tensor_ref(n.x);
+  const auto& w = state.const_tensor_ref(n.weight);
+  set_output(state, n.out, fast::rms_norm(x, w, n.eps, s));
 }
 
 // ----- RoPE -----
@@ -263,12 +255,7 @@ inline void do_quantized_linear(const Program&,
 
   // Add neural bias (post-matmul) if present
   if (n.bias) {
-    array b = state.const_tensor_ref(*n.bias);
-    if (b.ndim() == 1) {
-      auto shp = Y.shape();
-      for (size_t i = 0; i + 1 < shp.size(); ++i) shp[i] = 1;
-      b = reshape(b, shp);
-    }
+    const auto& b = state.const_tensor_ref(*n.bias);
     Y = add(Y, b, s);
   }
 

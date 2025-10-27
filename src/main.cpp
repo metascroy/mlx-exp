@@ -54,7 +54,7 @@ static array sample_next_token(const array& logits) {
 
 int main() {
   try {
-    const std::string model_pt  = env_or("MODEL_PT",   "model.pt");
+    const std::string model_pt  = env_or("MODEL_PT",   "model.safetensors");
     const std::string prompt_fp = env_or("PROMPT_IDS", "prompt_ids.txt");
     const int max_new_tokens    = env_or_int("MAX_NEW_TOKENS", 64);
     const int print_batch       = std::max(1, env_or_int("PRINT_BATCH", 1));
