@@ -2,16 +2,15 @@
 # Single source of truth for op schemas (Python side)
 # -----------------------------------------------------------------------------
 # - Mirrors C++ ops.hpp payloads
-# - Uses dataclasses + field(metadata=...) to tag READ/WRITE/ATTR roles
 # - Vid[T] is always scalar-domain (no scalar flag)
 # - Provides a registry OPS and helpers to derive read/write tables
 # -----------------------------------------------------------------------------
 
 from __future__ import annotations
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple, Type, Union, Generic, TypeVar
-
+import torch
 # -----------------------------------------------------------------------------
 # Core slot types for codegen
 # -----------------------------------------------------------------------------
@@ -26,21 +25,7 @@ class Vid(Generic[T]):
     """Value identifier parameterized by Python scalar type for codegen."""
     pass
 
-# -----------------------------------------------------------------------------
-# Role tags / helpers
-# -----------------------------------------------------------------------------
 
-class PortRole:
-    READ = "read"
-    WRITE = "write"
-    READWRITE = "readwrite"
-    ATTR = "attr"  # non-slot attribute
-    MAYBE_READ = "maybe_read"
-
-
-def port(role: str, *, optional: bool = False) -> Dict[str, Any]:
-    """Attach to dataclass field metadata."""
-    return {"role": role, "optional": optional}
 
 # -----------------------------------------------------------------------------
 # Op registry + meta helpers
@@ -72,6 +57,19 @@ class DTypeId(Enum):
     u32 = 5
     u8 = 6
     boolean = 7
+    i8 = 8
+
+_TORCH_DTYPE_TO_DTYPEID: Dict[torch.dtype, DTypeId] = {
+    torch.float16: DTypeId.f16,
+    torch.float32: DTypeId.f32,
+    torch.bfloat16: DTypeId.bf16,
+    torch.int32: DTypeId.i32,
+    torch.int64: DTypeId.i64,
+    torch.uint32: DTypeId.u32,
+    torch.uint8: DTypeId.u8,
+    torch.int8: DTypeId.i8,
+    torch.bool: DTypeId.boolean,
+}
 
 # -----------------------------------------------------------------------------
 # Op definitions — mirror of C++ payload structs
@@ -86,230 +84,211 @@ class NoopNode:
 @op("LINEAR")
 @dataclass
 class LinearNode:
-    x: Tid = field(metadata=port(PortRole.READ))
-    weight: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
-    bias: Optional[Tid] = field(default=None, metadata=port(PortRole.READ, optional=True))
+    x: Tid
+    weight: Tid
+    out: Tid
+    bias: Optional[Tid]
 
 
 @op("RMS_NORM")
 @dataclass
 class RMSNormNode:
-    x: Tid = field(metadata=port(PortRole.READ))
-    weight: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
-    eps: float = field(default=1e-5, metadata=port(PortRole.ATTR))
+    x: Tid
+    weight: Tid
+    out: Tid
+    eps: float
 
 
 @op("ROPE_APPLY")
 @dataclass
 class RopeNode:
-    q_in: Tid = field(metadata=port(PortRole.READ))
-    k_in: Tid = field(metadata=port(PortRole.READ))
-    q_out: Tid = field(metadata=port(PortRole.WRITE))
-    k_out: Tid = field(metadata=port(PortRole.WRITE))
-    head_dim: int = field(metadata=port(PortRole.ATTR))
-    pos: Vid[int] = field(metadata=port(PortRole.READ))
-    freqs: Optional[Tid] = field(default=None, metadata=port(PortRole.READ, optional=True))
-    traditional: bool = field(default=False, metadata=port(PortRole.ATTR))
-    base: Optional[float] = field(default=500000.0, metadata=port(PortRole.ATTR, optional=True))
-    scale: float = field(default=1.0, metadata=port(PortRole.ATTR))
+    q_in: Tid
+    k_in: Tid
+    q_out: Tid
+    k_out: Tid
+    head_dim: int
+    pos: Vid[int]
+    freqs: Optional[Tid]
+    traditional: bool
+    base: Optional[float]
+    scale: float
 
 
 @op("SDPA")
 @dataclass
 class SdpaNode:
-    q: Tid = field(metadata=port(PortRole.READ))
-    k: Tid = field(metadata=port(PortRole.READ))
-    v: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
-    scale: float = field(default=1.0, metadata=port(PortRole.ATTR))
-    mask: Optional[Tid] = field(default=None, metadata=port(PortRole.READ, optional=True))
-    causal: bool = field(default=False, metadata=port(PortRole.ATTR))
-
+    q: Tid
+    k: Tid
+    v: Tid
+    out: Tid
+    scale: float
+    mask: Optional[Tid]
+    causal: bool
 
 @op("ADD")
 @dataclass
 class AddNode:
-    a: Tid = field(metadata=port(PortRole.READ))
-    b: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
+    a: Tid
+    b: Tid
+    out: Tid
 
+@op("ADD_SCALAR")
+@dataclass
+class AddScalarNode:
+    a: Union[int, Vid[int]]
+    b: Union[int, Vid[int]]
+    out: Vid[int]
+
+@op("SYM_SIZE")
+@dataclass
+class SymSizeNode:
+    a: Tid
+    dim: int
+    out: Vid[int]
 
 @op("MUL")
 @dataclass
 class MulNode:
-    a: Tid = field(metadata=port(PortRole.READ))
-    b: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
-
+    a: Tid
+    b: Tid
+    out: Tid
 
 @op("SILU")
 @dataclass
 class SiluNode:
-    x: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
-
+    x: Tid
+    out: Tid
 
 @op("RESHAPE")
 @dataclass
 class ReshapeNode:
-    x: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
-    shape: List[int] = field(metadata=port(PortRole.ATTR))
+    x: Tid
+    out: Tid
+    shape: List[Union[int, Vid[int]]]
     __meta__ = op_meta(view_of="x")
 
 
 @op("TRANSPOSE")
 @dataclass
 class TransposeNode:
-    x: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
-    perm: List[int] = field(metadata=port(PortRole.ATTR))
+    x: Tid
+    out: Tid
+    perm: List[int]
     __meta__ = op_meta(view_of="x")
 
 
 @op("CONTIGUOUS")
 @dataclass
 class ContigNode:
-    x: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
+    x: Tid
+    out: Tid
 
+@op("ID_COPY")
+@dataclass
+class IdCopyNode:
+    x: Tid
+    out: Tid
 
 @op("GATHER")
 @dataclass
 class GatherNode:
-    table: Tid = field(metadata=port(PortRole.READ))
-    ids: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
-
+    table: Tid
+    ids: Tid
+    out: Tid
 
 @op("SLICE")
 @dataclass
 class SliceNode:
-    x: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
-    axis: Union[int, Vid[int]] = field(metadata=port(PortRole.MAYBE_READ))
-    start: Union[int, Vid[int]] = field(metadata=port(PortRole.MAYBE_READ))
-    length: Union[int, Vid[int]] = field(metadata=port(PortRole.MAYBE_READ))
-
+    x: Tid
+    out: Tid
+    axis: Union[int, Vid[int]]
+    start: Union[int, Vid[int]]
+    end: Union[int, Vid[int]]
 
 @op("CAST")
 @dataclass
 class CastNode:
-    x: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
-    dtype: DTypeId = field(default=DTypeId.f16, metadata=port(PortRole.ATTR))
+    x: Tid
+    out: Tid
+    dtype: DTypeId
 
 
 @op("QUANTIZED_LINEAR")
 @dataclass
 class QuantizedLinearNode:
-    x: Tid = field(metadata=port(PortRole.READ))
-    w: Tid = field(metadata=port(PortRole.READ))
-    scales: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))  # <-- move before defaults
-    biases: Optional[Tid] = field(default=None, metadata=port(PortRole.READ, optional=True))
-    bias: Optional[Tid] = field(default=None, metadata=port(PortRole.READ, optional=True))
-    group_size: int = field(default=64, metadata=port(PortRole.ATTR))
-    bits: int = field(default=4, metadata=port(PortRole.ATTR))
-    mode: str = field(default="affine", metadata=port(PortRole.ATTR))
-    out_dtype: DTypeId = field(default=DTypeId.f32, metadata=port(PortRole.ATTR))
+    x: Tid
+    w: Tid
+    scales: Tid
+    out: Tid
+    biases: Optional[Tid]
+    bias: Optional[Tid]
+    group_size: int
+    bits: int
+    mode: str
+    out_dtype: DTypeId
 
 
 @op("CONCAT")
 @dataclass
 class ConcatNode:
-    a: Tid = field(metadata=port(PortRole.READ))
-    b: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
-    axis: int = field(default=0, metadata=port(PortRole.ATTR))
+    a: Tid
+    b: Tid
+    out: Tid
+    axis: int
 
 
 @op("FULL")
 @dataclass
 class FullNode:
-    out: Tid = field(metadata=port(PortRole.WRITE))
-    shape: List[int] = field(metadata=port(PortRole.ATTR))
-    v: float = field(default=0.0, metadata=port(PortRole.ATTR))
-    dtype: DTypeId = field(default=DTypeId.f16, metadata=port(PortRole.ATTR))
+    out: Tid
+    shape: List[int]
+    v: float
+    dtype: DTypeId
 
 
 @op("ZEROS")
 @dataclass
 class ZerosNode:
-    out: Tid = field(metadata=port(PortRole.WRITE))
-    shape: List[int] = field(metadata=port(PortRole.ATTR))
-    dtype: DTypeId = field(default=DTypeId.f16, metadata=port(PortRole.ATTR))
+    out: Tid
+    shape: List[int]
+    dtype: DTypeId
 
 
 @op("ONES")
 @dataclass
 class OnesNode:
-    out: Tid = field(metadata=port(PortRole.WRITE))
-    shape: List[int] = field(metadata=port(PortRole.ATTR))
-    dtype: DTypeId = field(default=DTypeId.f16, metadata=port(PortRole.ATTR))
+    out: Tid
+    shape: List[int]
+    dtype: DTypeId
 
 
 @op("ARGMAX")
 @dataclass
 class ArgmaxNode:
-    x: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
-    axis: int = field(default=-1, metadata=port(PortRole.ATTR))
+    x: Tid
+    out: Tid
+    axis: int
 
 
 @op("SLICE_UPDATE")
 @dataclass
 class SliceUpdateNode:
-    dst: Tid = field(metadata=port(PortRole.READWRITE))
-    update: Tid = field(metadata=port(PortRole.READ))
-    axis: Union[int, Vid[int]] = field(metadata=port(PortRole.MAYBE_READ))
-    start: Union[int, Vid[int]] = field(metadata=port(PortRole.MAYBE_READ))
-    length: Union[int, Vid[int]] = field(metadata=port(PortRole.MAYBE_READ))
+    dst: Tid
+    update: Tid
+    axis: Union[int, Vid[int]]
+    start: Union[int, Vid[int]]
+    stop: Union[int, Vid[int]]
 
 
 @op("QUANTIZED_GATHER")
 @dataclass
 class QuantizedGatherNode:
-    table_q: Tid = field(metadata=port(PortRole.READ))
-    scales: Tid = field(metadata=port(PortRole.READ))
-    ids: Tid = field(metadata=port(PortRole.READ))
-    out: Tid = field(metadata=port(PortRole.WRITE))
-    biases: Optional[Tid] = field(default=None, metadata=port(PortRole.READ, optional=True))
-    group_size: int = field(default=64, metadata=port(PortRole.ATTR))
-    bits: int = field(default=4, metadata=port(PortRole.ATTR))
-    mode: str = field(default="affine", metadata=port(PortRole.ATTR))
-    out_dtype: DTypeId = field(default=DTypeId.f32, metadata=port(PortRole.ATTR))
-
-# -----------------------------------------------------------------------------
-# Derived tables (for codegen / liveness / validators)
-# -----------------------------------------------------------------------------
-
-def derive_reads_writes():
-    rw = {}
-    for opname, cls in OPS.items():
-        rnames, wnames = [], []
-        for f in fields(cls):
-            role = f.metadata.get("role")
-            if role in (PortRole.READ, PortRole.READWRITE, PortRole.MAYBE_READ):
-                rnames.append(f.name)
-            if role in (PortRole.WRITE, PortRole.READWRITE):
-                wnames.append(f.name)
-        rw[opname] = (tuple(rnames), tuple(wnames))
-    return rw
-
-
-def view_sources() -> Dict[str, str]:
-    """Return {opname: input_field_name_that_out_views} for true views."""
-    res: Dict[str, str] = {}
-    for opname, cls in OPS.items():
-        meta = getattr(cls, "__meta__", None)
-        if isinstance(meta, dict):
-            mm = meta.get("op_meta", {})
-            if "view_of" in mm:
-                res[opname] = mm["view_of"]
-    return res
-
-
-READS_WRITES: Dict[str, Tuple[Tuple[str, ...], Tuple[str, ...]]] = derive_reads_writes()
+    table_q: Tid
+    scales: Tid
+    ids: Tid
+    out: Tid
+    biases: Optional[Tid]
+    group_size: int
+    bits: int
+    mode: str
+    out_dtype: DTypeId

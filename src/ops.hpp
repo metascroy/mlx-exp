@@ -22,6 +22,7 @@ enum class DTypeId : int {
   u32,
   u8,
   boolean,
+  i8,
 };
 
 // -----------------------------------------------------------------------------
@@ -41,7 +42,7 @@ struct RMSNormNode {
   Tid x { Tid{} };
   Tid weight { Tid{} };
   Tid out { Tid{} };
-  float eps { 1e-05f };
+  float eps {};
 };
 
 struct RopeNode {
@@ -52,9 +53,9 @@ struct RopeNode {
   int head_dim {};
   Vid<int> pos { Vid<int>{} };
   std::optional<Tid> freqs { std::nullopt };
-  bool traditional { false };
-  std::optional<float> base { 500000.0f };
-  float scale { 1.0f };
+  bool traditional {};
+  std::optional<float> base { std::nullopt };
+  float scale {};
 };
 
 struct SdpaNode {
@@ -62,15 +63,27 @@ struct SdpaNode {
   Tid k { Tid{} };
   Tid v { Tid{} };
   Tid out { Tid{} };
-  float scale { 1.0f };
+  float scale {};
   std::optional<Tid> mask { std::nullopt };
-  bool causal { false };
+  bool causal {};
 };
 
 struct AddNode {
   Tid a { Tid{} };
   Tid b { Tid{} };
   Tid out { Tid{} };
+};
+
+struct AddScalarNode {
+  std::variant<int, Vid<int>> a { std::variant<int, Vid<int>>{} };
+  std::variant<int, Vid<int>> b { std::variant<int, Vid<int>>{} };
+  Vid<int> out { Vid<int>{} };
+};
+
+struct SymSizeNode {
+  Tid a { Tid{} };
+  int dim {};
+  Vid<int> out { Vid<int>{} };
 };
 
 struct MulNode {
@@ -87,7 +100,7 @@ struct SiluNode {
 struct ReshapeNode {
   Tid x { Tid{} };
   Tid out { Tid{} };
-  std::vector<int> shape {};
+  std::vector<std::variant<int, Vid<int>>> shape {};
 };
 
 struct TransposeNode {
@@ -97,6 +110,11 @@ struct TransposeNode {
 };
 
 struct ContigNode {
+  Tid x { Tid{} };
+  Tid out { Tid{} };
+};
+
+struct IdCopyNode {
   Tid x { Tid{} };
   Tid out { Tid{} };
 };
@@ -112,13 +130,13 @@ struct SliceNode {
   Tid out { Tid{} };
   std::variant<int, Vid<int>> axis { std::variant<int, Vid<int>>{} };
   std::variant<int, Vid<int>> start { std::variant<int, Vid<int>>{} };
-  std::variant<int, Vid<int>> length { std::variant<int, Vid<int>>{} };
+  std::variant<int, Vid<int>> end { std::variant<int, Vid<int>>{} };
 };
 
 struct CastNode {
   Tid x { Tid{} };
   Tid out { Tid{} };
-  DTypeId dtype { DTypeId::f16 };
+  DTypeId dtype {};
 };
 
 struct QuantizedLinearNode {
@@ -128,42 +146,42 @@ struct QuantizedLinearNode {
   Tid out { Tid{} };
   std::optional<Tid> biases { std::nullopt };
   std::optional<Tid> bias { std::nullopt };
-  int group_size { 64 };
-  int bits { 4 };
-  std::string mode { "affine" };
-  DTypeId out_dtype { DTypeId::f32 };
+  int group_size {};
+  int bits {};
+  std::string mode {};
+  DTypeId out_dtype {};
 };
 
 struct ConcatNode {
   Tid a { Tid{} };
   Tid b { Tid{} };
   Tid out { Tid{} };
-  int axis { 0 };
+  int axis {};
 };
 
 struct FullNode {
   Tid out { Tid{} };
   std::vector<int> shape {};
-  float v { 0.0f };
-  DTypeId dtype { DTypeId::f16 };
+  float v {};
+  DTypeId dtype {};
 };
 
 struct ZerosNode {
   Tid out { Tid{} };
   std::vector<int> shape {};
-  DTypeId dtype { DTypeId::f16 };
+  DTypeId dtype {};
 };
 
 struct OnesNode {
   Tid out { Tid{} };
   std::vector<int> shape {};
-  DTypeId dtype { DTypeId::f16 };
+  DTypeId dtype {};
 };
 
 struct ArgmaxNode {
   Tid x { Tid{} };
   Tid out { Tid{} };
-  int axis { -1 };
+  int axis {};
 };
 
 struct SliceUpdateNode {
@@ -171,7 +189,7 @@ struct SliceUpdateNode {
   Tid update { Tid{} };
   std::variant<int, Vid<int>> axis { std::variant<int, Vid<int>>{} };
   std::variant<int, Vid<int>> start { std::variant<int, Vid<int>>{} };
-  std::variant<int, Vid<int>> length { std::variant<int, Vid<int>>{} };
+  std::variant<int, Vid<int>> stop { std::variant<int, Vid<int>>{} };
 };
 
 struct QuantizedGatherNode {
@@ -180,10 +198,10 @@ struct QuantizedGatherNode {
   Tid ids { Tid{} };
   Tid out { Tid{} };
   std::optional<Tid> biases { std::nullopt };
-  int group_size { 64 };
-  int bits { 4 };
-  std::string mode { "affine" };
-  DTypeId out_dtype { DTypeId::f32 };
+  int group_size {};
+  int bits {};
+  std::string mode {};
+  DTypeId out_dtype {};
 };
 
 // -----------------------------------------------------------------------------
@@ -197,11 +215,14 @@ struct QuantizedGatherNode {
   X(ROPE_APPLY, RopeNode) \
   X(SDPA, SdpaNode) \
   X(ADD, AddNode) \
+  X(ADD_SCALAR, AddScalarNode) \
+  X(SYM_SIZE, SymSizeNode) \
   X(MUL, MulNode) \
   X(SILU, SiluNode) \
   X(RESHAPE, ReshapeNode) \
   X(TRANSPOSE, TransposeNode) \
   X(CONTIGUOUS, ContigNode) \
+  X(ID_COPY, IdCopyNode) \
   X(GATHER, GatherNode) \
   X(SLICE, SliceNode) \
   X(CAST, CastNode) \
@@ -239,11 +260,14 @@ using NodeVariant = std::variant<
   RopeNode,
   SdpaNode,
   AddNode,
+  AddScalarNode,
+  SymSizeNode,
   MulNode,
   SiluNode,
   ReshapeNode,
   TransposeNode,
   ContigNode,
+  IdCopyNode,
   GatherNode,
   SliceNode,
   CastNode,
@@ -265,11 +289,14 @@ enum : size_t {
   VAR_IDX_ROPE_APPLY,
   VAR_IDX_SDPA,
   VAR_IDX_ADD,
+  VAR_IDX_ADD_SCALAR,
+  VAR_IDX_SYM_SIZE,
   VAR_IDX_MUL,
   VAR_IDX_SILU,
   VAR_IDX_RESHAPE,
   VAR_IDX_TRANSPOSE,
   VAR_IDX_CONTIGUOUS,
+  VAR_IDX_ID_COPY,
   VAR_IDX_GATHER,
   VAR_IDX_SLICE,
   VAR_IDX_CAST,
@@ -291,11 +318,14 @@ template <> struct OpVariantIndex<OpCode::RMS_NORM> { static constexpr size_t va
 template <> struct OpVariantIndex<OpCode::ROPE_APPLY> { static constexpr size_t value = VAR_IDX_ROPE_APPLY; };
 template <> struct OpVariantIndex<OpCode::SDPA> { static constexpr size_t value = VAR_IDX_SDPA; };
 template <> struct OpVariantIndex<OpCode::ADD> { static constexpr size_t value = VAR_IDX_ADD; };
+template <> struct OpVariantIndex<OpCode::ADD_SCALAR> { static constexpr size_t value = VAR_IDX_ADD_SCALAR; };
+template <> struct OpVariantIndex<OpCode::SYM_SIZE> { static constexpr size_t value = VAR_IDX_SYM_SIZE; };
 template <> struct OpVariantIndex<OpCode::MUL> { static constexpr size_t value = VAR_IDX_MUL; };
 template <> struct OpVariantIndex<OpCode::SILU> { static constexpr size_t value = VAR_IDX_SILU; };
 template <> struct OpVariantIndex<OpCode::RESHAPE> { static constexpr size_t value = VAR_IDX_RESHAPE; };
 template <> struct OpVariantIndex<OpCode::TRANSPOSE> { static constexpr size_t value = VAR_IDX_TRANSPOSE; };
 template <> struct OpVariantIndex<OpCode::CONTIGUOUS> { static constexpr size_t value = VAR_IDX_CONTIGUOUS; };
+template <> struct OpVariantIndex<OpCode::ID_COPY> { static constexpr size_t value = VAR_IDX_ID_COPY; };
 template <> struct OpVariantIndex<OpCode::GATHER> { static constexpr size_t value = VAR_IDX_GATHER; };
 template <> struct OpVariantIndex<OpCode::SLICE> { static constexpr size_t value = VAR_IDX_SLICE; };
 template <> struct OpVariantIndex<OpCode::CAST> { static constexpr size_t value = VAR_IDX_CAST; };

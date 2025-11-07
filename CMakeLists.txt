@@ -24,6 +24,18 @@ set(MLX_METAL_JIT OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(third-party/mlx)
 
+include(FetchContent)
+if (NOT TARGET nlohmann_json::nlohmann_json)
+  FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+  )
+  FetchContent_MakeAvailable(nlohmann_json)
+endif()
+
 add_executable(run_llm src/main.cpp)
 target_link_libraries(run_llm PRIVATE mlx)
 target_include_directories(run_llm PRIVATE third-party/mlx/include)
+
+target_link_libraries(run_llm PRIVATE nlohmann_json::nlohmann_json)

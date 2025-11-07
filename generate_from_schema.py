@@ -68,6 +68,13 @@ def _is_union_int_vid(ann) -> bool:
             return _is_vid(other)
     return False
 
+def _is_list_of_union_int_vid(ann) -> bool:
+    # List[Union[int, Vid[int]]]
+    if get_origin(ann) in (list, List):
+        (elem,) = get_args(ann)
+        return _is_union_int_vid(elem)
+    return False
+
 def _resolved_ann_map(cls) -> Dict[str, Any]:
     return get_type_hints(cls, globalns=vars(S), localns=vars(S))
 
@@ -120,6 +127,8 @@ def _ctype(resolved_ann: Any) -> str:
         c = "std::vector<int>"
     elif _is_list_of_str(base):
         c = "std::vector<std::string>"
+    elif _is_list_of_union_int_vid(base):
+        c = "std::vector<std::variant<int, Vid<int>>>"
     elif _is_dtype_enum(base):
         c = "DTypeId"
     elif _is_tid(base):
