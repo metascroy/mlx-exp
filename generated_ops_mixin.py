@@ -15,25 +15,33 @@ class OpsMixin:
     def NOOP(self) -> None:
         self._emit("NOOP")
 
-    def LINEAR(self, *, x: Any, weight: Any, out: Any, bias: Optional[Any] = None) -> None:
+    def LINEAR(self, *, x: Any, weight: Any, out: Any, bias: Optional[Any]) -> None:
         payload = self._coerce_payload("LINEAR", locals())
         self._emit("LINEAR", **payload)
 
-    def RMS_NORM(self, *, x: Any, weight: Any, out: Any, eps: float = 1e-05) -> None:
+    def RMS_NORM(self, *, x: Any, weight: Any, out: Any, eps: float) -> None:
         payload = self._coerce_payload("RMS_NORM", locals())
         self._emit("RMS_NORM", **payload)
 
-    def ROPE_APPLY(self, *, q_in: Any, k_in: Any, q_out: Any, k_out: Any, head_dim: int, pos: Any, freqs: Optional[Any] = None, traditional: bool = False, base: Optional[float] = 500000.0, scale: float = 1.0) -> None:
+    def ROPE_APPLY(self, *, q_in: Any, k_in: Any, q_out: Any, k_out: Any, head_dim: int, pos: Any, freqs: Optional[Any], traditional: bool, base: Optional[float], scale: float) -> None:
         payload = self._coerce_payload("ROPE_APPLY", locals())
         self._emit("ROPE_APPLY", **payload)
 
-    def SDPA(self, *, q: Any, k: Any, v: Any, out: Any, scale: float = 1.0, mask: Optional[Any] = None, causal: bool = False) -> None:
+    def SDPA(self, *, q: Any, k: Any, v: Any, out: Any, scale: float, mask: Optional[Any], causal: bool) -> None:
         payload = self._coerce_payload("SDPA", locals())
         self._emit("SDPA", **payload)
 
     def ADD(self, *, a: Any, b: Any, out: Any) -> None:
         payload = self._coerce_payload("ADD", locals())
         self._emit("ADD", **payload)
+
+    def ADD_SCALAR(self, *, a: int | Any, b: int | Any, out: Any) -> None:
+        payload = self._coerce_payload("ADD_SCALAR", locals())
+        self._emit("ADD_SCALAR", **payload)
+
+    def SYM_SIZE(self, *, a: Any, dim: int, out: Any) -> None:
+        payload = self._coerce_payload("SYM_SIZE", locals())
+        self._emit("SYM_SIZE", **payload)
 
     def MUL(self, *, a: Any, b: Any, out: Any) -> None:
         payload = self._coerce_payload("MUL", locals())
@@ -43,7 +51,7 @@ class OpsMixin:
         payload = self._coerce_payload("SILU", locals())
         self._emit("SILU", **payload)
 
-    def RESHAPE(self, *, x: Any, out: Any, shape: List[int]) -> None:
+    def RESHAPE(self, *, x: Any, out: Any, shape: Any) -> None:
         payload = self._coerce_payload("RESHAPE", locals())
         self._emit("RESHAPE", **payload)
 
@@ -55,46 +63,50 @@ class OpsMixin:
         payload = self._coerce_payload("CONTIGUOUS", locals())
         self._emit("CONTIGUOUS", **payload)
 
+    def ID_COPY(self, *, x: Any, out: Any) -> None:
+        payload = self._coerce_payload("ID_COPY", locals())
+        self._emit("ID_COPY", **payload)
+
     def GATHER(self, *, table: Any, ids: Any, out: Any) -> None:
         payload = self._coerce_payload("GATHER", locals())
         self._emit("GATHER", **payload)
 
-    def SLICE(self, *, x: Any, out: Any, axis: int | Any, start: int | Any, length: int | Any) -> None:
+    def SLICE(self, *, x: Any, out: Any, axis: int | Any, start: int | Any, end: int | Any) -> None:
         payload = self._coerce_payload("SLICE", locals())
         self._emit("SLICE", **payload)
 
-    def CAST(self, *, x: Any, out: Any, dtype: DTypeId | str = 'f16') -> None:
+    def CAST(self, *, x: Any, out: Any, dtype: DTypeId | str) -> None:
         payload = self._coerce_payload("CAST", locals())
         self._emit("CAST", **payload)
 
-    def QUANTIZED_LINEAR(self, *, x: Any, w: Any, scales: Any, out: Any, biases: Optional[Any] = None, bias: Optional[Any] = None, group_size: int = 64, bits: int = 4, mode: str = 'affine', out_dtype: DTypeId | str = 'f32') -> None:
+    def QUANTIZED_LINEAR(self, *, x: Any, w: Any, scales: Any, out: Any, biases: Optional[Any], bias: Optional[Any], group_size: int, bits: int, mode: str, out_dtype: DTypeId | str) -> None:
         payload = self._coerce_payload("QUANTIZED_LINEAR", locals())
         self._emit("QUANTIZED_LINEAR", **payload)
 
-    def CONCAT(self, *, a: Any, b: Any, out: Any, axis: int = 0) -> None:
+    def CONCAT(self, *, a: Any, b: Any, out: Any, axis: int) -> None:
         payload = self._coerce_payload("CONCAT", locals())
         self._emit("CONCAT", **payload)
 
-    def FULL(self, *, out: Any, shape: List[int], v: float = 0.0, dtype: DTypeId | str = 'f16') -> None:
+    def FULL(self, *, out: Any, shape: List[int], v: float, dtype: DTypeId | str) -> None:
         payload = self._coerce_payload("FULL", locals())
         self._emit("FULL", **payload)
 
-    def ZEROS(self, *, out: Any, shape: List[int], dtype: DTypeId | str = 'f16') -> None:
+    def ZEROS(self, *, out: Any, shape: List[int], dtype: DTypeId | str) -> None:
         payload = self._coerce_payload("ZEROS", locals())
         self._emit("ZEROS", **payload)
 
-    def ONES(self, *, out: Any, shape: List[int], dtype: DTypeId | str = 'f16') -> None:
+    def ONES(self, *, out: Any, shape: List[int], dtype: DTypeId | str) -> None:
         payload = self._coerce_payload("ONES", locals())
         self._emit("ONES", **payload)
 
-    def ARGMAX(self, *, x: Any, out: Any, axis: int = -1) -> None:
+    def ARGMAX(self, *, x: Any, out: Any, axis: int) -> None:
         payload = self._coerce_payload("ARGMAX", locals())
         self._emit("ARGMAX", **payload)
 
-    def SLICE_UPDATE(self, *, dst: Any, update: Any, axis: int | Any, start: int | Any, length: int | Any) -> None:
+    def SLICE_UPDATE(self, *, dst: Any, update: Any, axis: int | Any, start: int | Any, stop: int | Any) -> None:
         payload = self._coerce_payload("SLICE_UPDATE", locals())
         self._emit("SLICE_UPDATE", **payload)
 
-    def QUANTIZED_GATHER(self, *, table_q: Any, scales: Any, ids: Any, out: Any, biases: Optional[Any] = None, group_size: int = 64, bits: int = 4, mode: str = 'affine', out_dtype: DTypeId | str = 'f32') -> None:
+    def QUANTIZED_GATHER(self, *, table_q: Any, scales: Any, ids: Any, out: Any, biases: Optional[Any], group_size: int, bits: int, mode: str, out_dtype: DTypeId | str) -> None:
         payload = self._coerce_payload("QUANTIZED_GATHER", locals())
         self._emit("QUANTIZED_GATHER", **payload)

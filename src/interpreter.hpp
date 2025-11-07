@@ -18,11 +18,36 @@
 
 namespace executorch::mlx {
 
+
+static inline void log_op(const executorch::mlx::ExecutionState& st, Tid id, std::string name) {
+  // auto out = st.const_tensor_ref(id);
+  // std::cout << "OP " << name << " (" << out.shape() << "): " << out << "\n";
+}
+
+
 // -----------------------------------------------------------------------------
 // Local helpers
 // -----------------------------------------------------------------------------
 static inline ::mlx::core::Shape to_shape(const std::vector<int>& v) {
   return ::mlx::core::Shape(v.begin(), v.end());
+}
+
+static inline ::mlx::core::Shape to_shape(const std::vector<std::variant<int, Vid<int>>>& dims,
+         const ExecutionState& st) {
+  std::vector<int> out;
+  out.reserve(dims.size());
+  for (const auto& d : dims) {
+    if (std::holds_alternative<int>(d)) {
+      out.push_back(std::get<int>(d));
+    } else {
+      // runtime dim: fetch the value from the state
+      const auto vid = std::get<Vid<int>>(d);
+      // adjust to your API; this is the only guessy part:
+      int v = st.const_value_ref<int>(vid);   // or st.get_value<int>(vid) or st.val(vid)
+      out.push_back(v);
+    }
+  }
+  return ::mlx::core::Shape(out.begin(), out.end());
 }
 
 static inline ::mlx::core::Dtype to_dtype(DTypeId d) {
@@ -78,6 +103,7 @@ inline void do_linear(const Program&,
   }
 
   set_output(state, n.out, std::move(Y));
+  log_op(state, n.out, "LINEAR");
 }
 
 // ----- RMSNorm -----
@@ -89,6 +115,7 @@ inline void do_rmsnorm(const Program&,
   const auto& x = state.const_tensor_ref(n.x);
   const auto& w = state.const_tensor_ref(n.weight);
   set_output(state, n.out, fast::rms_norm(x, w, n.eps, s));
+  log_op(state, n.out, "RMS");
 }
 
 // ----- RoPE -----
@@ -100,18 +127,26 @@ inline void do_rope(const Program&,
 
   const array& Q = state.const_tensor_ref(r.q_in);
   const array& K = state.const_tensor_ref(r.k_in);
+
+  // runtime position
   const int offset = state.value_ref<int32_t>(r.pos);
+
   std::optional<array> freqs_arr = std::nullopt;
   if (r.freqs) {
     freqs_arr = state.const_tensor_ref(*r.freqs);
   }
+
 
   array Qr = fast::rope(Q, r.head_dim, r.traditional, r.base, r.scale, offset, freqs_arr, s);
   array Kr = fast::rope(K, r.head_dim, r.traditional, r.base, r.scale, offset, freqs_arr, s);
 
   set_output(state, r.q_out, std::move(Qr));
   set_output(state, r.k_out, std::move(Kr));
+
+  log_op(state, r.q_out, "ROPE_Q_OUT");
+  log_op(state, r.k_out, "ROPE_K_OUT");
 }
+
 
 // ----- SDPA -----
 inline void do_sdpa_fused(const Program&,
@@ -139,6 +174,7 @@ inline void do_sdpa_fused(const Program&,
       Q, K, V, static_cast<float>(sdp.scale), mask_mode, mask_arrs, sinks, s
   );
   set_output(state, sdp.out, std::move(out));
+  log_op(state, sdp.out, "SDPA");
 }
 
 // ----- Slice (single-axis scalar Vids {axis,start,length}) -----
@@ -158,11 +194,10 @@ inline void do_slice(const Program&,
 
   int axis  = resolve(n.axis);
   int start = resolve(n.start);
-  int len   = resolve(n.length);
+  int stop   = resolve(n.end);
 
   if (axis < 0) axis += rank;
   if (axis < 0 || axis >= rank) throw std::out_of_range("Slice: axis out of range");
-  if (len < 0) throw std::invalid_argument("Slice: length must be >= 0");
 
   std::vector<int> vstart(rank, 0);
   std::vector<int> vstop;
@@ -173,13 +208,17 @@ inline void do_slice(const Program&,
   const int dim = vstop[axis];
   if (start < 0) start += dim;
   start = std::max(0, std::min(start, dim));
-  int stop = std::min(start + len, dim);
+  if (stop < 0) stop += dim;
+  stop = std::max(0, std::min(stop, dim));
 
   vstart[axis] = start;
   vstop[axis]  = stop;
 
   set_output(state, n.out, slice(x, to_shape(vstart), to_shape(vstop), s));
+
+  log_op(state, n.out, "SLICE");
 }
+
 
 // ----- SliceUpdate (single-axis scalar Vids {axis,start,length}) -----
 inline void do_slice_update(const Program&,
@@ -199,11 +238,10 @@ inline void do_slice_update(const Program&,
 
   int axis  = resolve(n.axis);
   int start = resolve(n.start);
-  int len   = resolve(n.length);
+  int stop   = resolve(n.stop);
 
   if (axis < 0) axis += rank;
   if (axis < 0 || axis >= rank) throw std::out_of_range("SliceUpdate: axis out of range");
-  if (len < 0) throw std::invalid_argument("SliceUpdate: length must be >= 0");
 
   std::vector<int> vstart(rank, 0);
   std::vector<int> vstop;
@@ -218,12 +256,16 @@ inline void do_slice_update(const Program&,
 
   if (start < 0) start += dst_dim;
   start = std::max(0, std::min(start, dst_dim));
-  int stop = std::min(start + len, dst_dim);
+
+  if (stop < 0) stop += dst_dim;
+  stop = std::max(0, std::min(stop, dst_dim));
 
   vstart[axis] = start;
   vstop[axis]  = stop;
 
   dst = slice_update(dst, upd, to_shape(vstart), to_shape(vstop), s);
+
+  log_op(state, n.dst, "SLICE_UPDATE");
 }
 
 // ----- Quantized Linear -----
@@ -259,7 +301,7 @@ inline void do_quantized_linear(const Program&,
     Y = add(Y, b, s);
   }
 
-  if (n.out_dtype != DTypeId::f32)
+  if (to_dtype(n.out_dtype) != Y.dtype())
     Y = astype(Y, to_dtype(n.out_dtype), s);
 
   set_output(state, n.out, std::move(Y));
@@ -273,7 +315,7 @@ inline void do_quantized_gather(const Program&,
   using namespace ::mlx::core;
 
   array ids = state.const_tensor_ref(n.ids);
-  if (ids.dtype() != int32) ids = astype(ids, int32, s);
+  // if (ids.dtype() != int32) ids = astype(ids, int32, s);
 
   array Wq = state.const_tensor_ref(n.table_q);
   array Sc = state.const_tensor_ref(n.scales);
@@ -296,7 +338,7 @@ inline void do_quantized_gather(const Program&,
       /*stream=*/s
   );
 
-  if (n.out_dtype != DTypeId::f32)
+  if (to_dtype(n.out_dtype) != Y.dtype())
     Y = astype(Y, to_dtype(n.out_dtype), s);
 
   set_output(state, n.out, std::move(Y));
@@ -313,6 +355,11 @@ OP_LIST(DECL_HANDLER)
 #undef DECL_HANDLER
 
 static void op_NOOP(const Instr&, const Program&, ExecutionState&, StreamOrDevice) {}
+
+static void op_ID_COPY(const Instr& ins, const Program& prog, ExecutionState& st, StreamOrDevice s) {
+  const auto& n = ins.get<IdCopyNode>();
+  set_output(st, n.out, st.const_tensor_ref(n.x));
+}
 
 static void op_LINEAR(const Instr& ins, const Program& prog, ExecutionState& st, StreamOrDevice s) {
   impl::do_linear(prog, st, ins.get<LinearNode>(), s);
@@ -331,23 +378,59 @@ static void op_ADD(const Instr& ins, const Program&, ExecutionState& st, StreamO
   using namespace ::mlx::core;
   const auto& n = ins.get<AddNode>();
   set_output(st, n.out, add(st.const_tensor_ref(n.a), st.const_tensor_ref(n.b), s));
+  log_op(st, n.out, "ADD");
 }
+
+static void op_ADD_SCALAR(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+  using namespace ::mlx::core;
+  const auto& n = ins.get<AddScalarNode>();
+  auto resolve = [&](const std::variant<int, Vid<int>>& v) -> int {
+    if (std::holds_alternative<int>(v)) return std::get<int>(v);
+    return st.const_value_ref<int32_t>(std::get<Vid<int>>(v));
+  };
+  int res = resolve(n.a) + resolve(n.b);
+  st.values[n.out.idx] = res;
+}
+
+static void op_SYM_SIZE(const Instr& ins,
+                        const Program&,
+                        ExecutionState& st,
+                        StreamOrDevice) {
+  using namespace ::mlx::core;
+
+  const auto& n = ins.get<SymSizeNode>();
+  const array& a = st.const_tensor_ref(n.a);
+  int rank = static_cast<int>(a.ndim());
+  int dim  = n.dim;
+  if (dim < 0) dim += rank;
+  if (dim < 0 || dim >= rank) {
+    throw std::out_of_range("SYM_SIZE: dim out of range");
+  }
+
+  int32_t size = static_cast<int32_t>(a.shape()[dim]);
+
+  st.values[n.out.idx] = size;
+}
+
 static void op_MUL(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<MulNode>();
   set_output(st, n.out, multiply(st.const_tensor_ref(n.a), st.const_tensor_ref(n.b), s));
+  log_op(st, n.out, "MUL");
 }
 static void op_SILU(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<SiluNode>();
   const auto& x = st.const_tensor_ref(n.x);
   set_output(st, n.out, multiply(x, sigmoid(x, s), s));
+  log_op(st, n.out, "SILU");
 }
 
 static void op_RESHAPE(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice) {
   using namespace ::mlx::core;
   const auto& n = ins.get<ReshapeNode>();
-  set_output(st, n.out, reshape(st.const_tensor_ref(n.x), to_shape(n.shape)));
+  auto new_shape = to_shape(n.shape, st);
+  set_output(st, n.out, reshape(st.const_tensor_ref(n.x), new_shape));
 }
 static void op_TRANSPOSE(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
@@ -364,6 +447,7 @@ static void op_GATHER(const Instr& ins, const Program&, ExecutionState& st, Stre
   using namespace ::mlx::core;
   const auto& n = ins.get<GatherNode>();
   set_output(st, n.out, take(st.const_tensor_ref(n.table), st.const_tensor_ref(n.ids), /*axis=*/0, s));
+  log_op(st, n.out, "GATHER");
 }
 
 static void op_SLICE(const Instr& ins, const Program& prog, ExecutionState& st, StreamOrDevice s) {
@@ -402,7 +486,7 @@ static void op_ARGMAX(const Instr& ins, const Program&, ExecutionState& st, Stre
   using namespace ::mlx::core;
   const auto& n = ins.get<ArgmaxNode>();
   array idx = argmax(st.const_tensor_ref(n.x), n.axis, s);
-  if (idx.dtype() != int32) idx = astype(idx, int32, s);
+  // if (idx.dtype() != int32) idx = astype(idx, int32, s);
   set_output(st, n.out, std::move(idx));
 }
 
@@ -442,10 +526,13 @@ struct Interpreter {
     if (st.P != &prog) st.bind(prog);
 
     for (const auto& ins : prog.code) {
+      // std::cout << "Running instruction: " << static_cast<int>(ins.op) << "\n";
       switch (ins.op) {
         // Tiny / frequent ops: inline path
         case OpCode::NOOP:        op_NOOP(ins, prog, st, stream);        continue;
         case OpCode::ADD:         op_ADD(ins, prog, st, stream);         continue;
+        case OpCode::ADD_SCALAR:     op_ADD_SCALAR(ins, prog, st, stream);     continue;
+        case OpCode::SYM_SIZE:    op_SYM_SIZE(ins, prog, st, stream);    continue;
         case OpCode::MUL:         op_MUL(ins, prog, st, stream);         continue;
         case OpCode::SILU:        op_SILU(ins, prog, st, stream);        continue;
         case OpCode::RESHAPE:     op_RESHAPE(ins, prog, st, stream);     continue;
