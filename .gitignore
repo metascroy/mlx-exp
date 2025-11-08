@@ -1,0 +1,99 @@
+# ===========================================
+# Core build artifacts
+# ===========================================
+build/
+build*/
+*.o
+*.obj
+*.so
+*.dll
+*.dylib
+*.a
+*.lib
+*.out
+*.exe
+*.log
+
+# ===========================================
+# Python caches
+# ===========================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ===========================================
+# CMake / Ninja intermediate files
+# ===========================================
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+compile_commands.json
+*.ninja
+.ninja_deps
+.ninja_log
+
+# ===========================================
+# Xcode & macOS artifacts
+# ===========================================
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcworkspace/xcshareddata/WorkspaceSettings.xcsettings
+*.xcuserdata/
+*.xcuserdatad
+*.xcscmblueprint
+*.DS_Store
+*.swp
+
+# ===========================================
+# Xcode build products
+# ===========================================
+*.app/
+*.ipa
+*.dSYM/
+*.framework/
+*.xcarchive
+build/
+Build/
+Products/
+Pods/
+# (ignore anything under DerivedData regardless of location)
+*/DerivedData/
+
+# ===========================================
+# iOS / MLX temporary files
+# ===========================================
+default.metallib
+mlx.metallib
+*.metallib
+
+# ===========================================
+# MLX / model artifacts
+# ===========================================
+output_ids.txt
+prompt_ids.txt
+prog.json
+*.safetensors
+
+# ===========================================
+# Local config or generated ops
+# ===========================================
+*_cpython-*.pyc
+*.ipynb_checkpoints/
+
+# ===========================================
+# IDE / Editor cruft
+# ===========================================
+.vscode/
+.idea/
+*.iml
+*.code-workspace
+
+# ===========================================
+# Xcode app we’re ignoring (old one)
+# ===========================================
+third-party/mlx/
+
+LLMDemo/LLMDemo/Resources/*
