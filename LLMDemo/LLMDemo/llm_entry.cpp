@@ -137,13 +137,16 @@ int run_llm_generation(const char* prog_json_path_c,
 
     set_wired_limit(4L * (1 << 30)); // 4GB
     Interpreter I;
-
+      
+    assert(P.num_outputs() == 1);
+    auto out_tid = std::get<Tid>(P.output_map[0]);
+      
     // ---------------- prefill ----------------
     log_msg(on_log, user, "Start prefill");
     auto t0p = std::chrono::steady_clock::now();
     I.run(P, S);
 
-    const auto& logits_prefill = get_tensor_cref_by_name("linear_112");
+    const auto& logits_prefill = S.const_tensor_ref(out_tid);
     array next_ids = sample_next_token(logits_prefill);
     eval(next_ids);
     int prefill_token = next_ids.item<int>();
@@ -171,7 +174,7 @@ int run_llm_generation(const char* prog_json_path_c,
         clear_cache();
       }
 
-      const auto& logits = get_tensor_cref_by_name("linear_112");
+      const auto& logits = S.const_tensor_ref(out_tid);
       array next_ids2 = sample_next_token(logits);
       async_eval(next_ids2);
 

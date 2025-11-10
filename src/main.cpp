@@ -137,12 +137,18 @@ int main() {
 
     Interpreter I;
 
+    // Get output
+    assert(P.num_outputs() == 1);
+    auto out_tid = std::get<Tid>(P.output_map[0]);
+
     // ---------------- prefill ----------------
     std::cout << "Running prefill on T=" << T_prefill << "…\n";
     auto t0p = std::chrono::steady_clock::now();
     I.run(P, S);
 
-    const auto& logits_prefill = get_tensor_cref_by_name("linear_112");
+
+
+    const auto& logits_prefill = S.const_tensor_ref(out_tid);
     array next_ids = sample_next_token(logits_prefill);
     eval(next_ids); // Include in prefill timing
     auto t1p = std::chrono::steady_clock::now();
@@ -163,7 +169,7 @@ int main() {
       I.run(P, S);
     }
 
-    const auto& logits1 = get_tensor_cref_by_name("linear_112");
+    const auto& logits1 = S.const_tensor_ref(out_tid);
     array next_ids2 = sample_next_token(logits1);
     async_eval(next_ids2);   // schedule
     int tok_id = next_ids2.item<int>();
@@ -190,7 +196,7 @@ int main() {
       I.run(P, S);
 
       // get logits, schedule next, store for print
-      const auto& logits = get_tensor_cref_by_name("linear_112");
+      const auto& logits = S.const_tensor_ref(out_tid);
       array nx = sample_next_token(logits);
       async_eval(nx);
       pending.push_back(nx);
