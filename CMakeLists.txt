@@ -39,3 +39,11 @@ target_link_libraries(run_llm PRIVATE mlx)
 target_include_directories(run_llm PRIVATE third-party/mlx/include)
 
 target_link_libraries(run_llm PRIVATE nlohmann_json::nlohmann_json)
+
+
+
+
+add_executable(run_whisper src/main_whisper.cpp)
+target_link_libraries(run_whisper PRIVATE mlx)
+target_include_directories(run_whisper PRIVATE third-party/mlx/include)
+target_link_libraries(run_whisper PRIVATE nlohmann_json::nlohmann_json)

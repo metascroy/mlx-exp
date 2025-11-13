@@ -180,6 +180,7 @@ inline Program program_from_json(const nlohmann::json& jprog) {
 
   for (const auto& jinstr : jcode) {
     const std::string op = jinstr.at("op").get<std::string>();
+    // std::cout << "DOING OP " << op << std::endl;
 
     // ========== NOOP ==========
     if (op == "NOOP") {
@@ -305,6 +306,47 @@ inline Program program_from_json(const nlohmann::json& jprog) {
       n.dim = detail::parse_int_strict(jinstr.at("dim"));
       n.out = detail::parse_vid_int_obj(jinstr.at("out"));
       P.code.push_back(make_SYM_SIZE(std::move(n)));
+    }
+    else if (op == "CONV_1D") {
+      Conv1DNode n;
+      n.x   = detail::parse_tid_obj(jinstr.at("x"));
+      n.w = detail::parse_tid_obj(jinstr.at("w"));
+      n.out = detail::parse_tid_obj(jinstr.at("out"));
+      n.stride = detail::parse_int_strict(jinstr.at("stride"));
+      n.padding = detail::parse_int_strict(jinstr.at("padding"));
+      n.dilation = detail::parse_int_strict(jinstr.at("dilation"));
+      n.groups = detail::parse_int_strict(jinstr.at("groups"));
+      P.code.push_back(make_CONV_1D(std::move(n)));
+    }
+    else if (op == "GELU") {
+      GeluNode n;
+      n.x   = detail::parse_tid_obj(jinstr.at("x"));
+      n.out = detail::parse_tid_obj(jinstr.at("out"));
+      P.code.push_back(make_GELU(std::move(n)));
+    }
+    else if (op == "ARANGE") {
+      ARangeNode n;
+      n.out = detail::parse_tid_obj(jinstr.at("out"));
+      n.start = detail::parse_int_strict(jinstr.at("start"));
+      n.stop = detail::parse_int_strict(jinstr.at("stop"));
+      n.step = detail::parse_int_strict(jinstr.at("step"));
+
+      auto dtype = jinstr.at("dtype");
+      std::string dtype_string = "DTypeId.i32";
+      if (!dtype.is_null()) { // TODO: handle null in interpreter?
+        dtype_string = dtype.get<std::string>();
+      }
+      n.dtype = detail::parse_dtype(dtype_string);
+      P.code.push_back(make_ARANGE(std::move(n)));
+    }
+    else if (op == "LAYER_NORM") {
+      LayerNormNode n;
+      n.x = detail::parse_tid_obj(jinstr.at("x"));
+      n.out = detail::parse_tid_obj(jinstr.at("out"));
+      n.weight = detail::parse_tid_obj(jinstr.at("weight")); // TOOD: make sure null is handled
+      n.bias = detail::parse_tid_obj(jinstr.at("bias")); // TODO: make sure null is handled
+      n.eps = jinstr.at("eps").get<float>();
+      P.code.push_back(make_LAYER_NORM(std::move(n)));
     }
     // ========== CONTIGUOUS ==========
     else if (op == "CONTIGUOUS") {

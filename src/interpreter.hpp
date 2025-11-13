@@ -21,7 +21,7 @@ namespace executorch::mlx {
 
 static inline void log_op(const executorch::mlx::ExecutionState& st, Tid id, std::string name) {
   // auto out = st.const_tensor_ref(id);
-  // std::cout << "OP " << name << " (" << out.shape() << "): " << out << "\n";
+  // std::cout << "OP " << name << " (" << out.shape() << ") (tid=" << id.idx << ")\n"; //  " << out << "\n";
 }
 
 
@@ -381,6 +381,59 @@ static void op_ADD(const Instr& ins, const Program&, ExecutionState& st, StreamO
   log_op(st, n.out, "ADD");
 }
 
+static void op_CONV_1D(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+  using namespace ::mlx::core;
+  const auto& n = ins.get<Conv1DNode>();
+  const auto& x = st.const_tensor_ref(n.x);
+  const auto& w = st.const_tensor_ref(n.w);
+  log_op(st, n.x, "CONV_1D_IN");
+  auto out = conv1d(x, w, n.stride, n.padding, n.dilation, n.groups, s);
+  set_output(st, n.out, out);
+  log_op(st, n.out, "CONV_1D");
+}
+
+static void op_LAYER_NORM(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+  using namespace ::mlx::core;
+  using namespace ::mlx::core::fast;
+
+  const auto& n = ins.get<LayerNormNode>();
+  const auto& x = st.const_tensor_ref(n.x);
+
+  std::optional<array> w = std::nullopt;
+  if (n.weight) {
+    w = st.const_tensor_ref(*n.weight);
+  }
+  std::optional<array> bias = std::nullopt;
+  if (n.bias) {
+    bias = st.const_tensor_ref(*n.bias);
+  }
+  auto out = layer_norm(x, w, bias, n.eps, s);
+  set_output(st, n.out, out);
+  log_op(st, n.out, "LAYER_NORM");
+}
+
+static void op_GELU(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+  using namespace ::mlx::core;
+  const auto& n = ins.get<GeluNode>();
+  const auto& x = st.const_tensor_ref(n.x);
+
+  // This is a fast approx of GELU: TODO, implement other variants
+  // https://ml-explore.github.io/mlx/build/html/python/nn/_autosummary/mlx.nn.GELU.html
+  set_output(st, n.out, multiply(x, sigmoid(1.702 * x, s), s));
+  log_op(st, n.out, "GELU");
+}
+
+static void op_ARANGE(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+  using namespace ::mlx::core;
+  const auto& n = ins.get<ARangeNode>();
+  auto dtype = int32;
+  if (n.dtype) {
+    dtype = to_dtype(*n.dtype);
+  }
+  set_output(st, n.out, arange(n.start, n.stop, n.step, dtype, s));
+  log_op(st, n.out, "ARANGE");
+}
+
 static void op_ADD_SCALAR(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<AddScalarNode>();
@@ -431,11 +484,13 @@ static void op_RESHAPE(const Instr& ins, const Program&, ExecutionState& st, Str
   const auto& n = ins.get<ReshapeNode>();
   auto new_shape = to_shape(n.shape, st);
   set_output(st, n.out, reshape(st.const_tensor_ref(n.x), new_shape));
+  log_op(st, n.out, "RESHAPE");
 }
 static void op_TRANSPOSE(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<TransposeNode>();
   set_output(st, n.out, transpose(st.const_tensor_ref(n.x), n.perm, s));
+  log_op(st, n.out, "TRANSPOSE");
 }
 static void op_CONTIGUOUS(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
