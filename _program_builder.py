@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, Iterable, Callable
 from collections import defaultdict
 import tqdm
+import uuid
 
 # Generated mixin (from your codegen)
 from generated_ops_mixin import OpsMixin
@@ -190,6 +191,15 @@ class SlotManager:
         slot = Slot(id_type=IdType.Tensor, id_space=id_space, idx=idx)
         self.name_to_slot[name] = slot
         return slot
+    
+    def make_tmp_slot(self) -> Tuple[str, Slot]:
+        name = f"tmp_{uuid.uuid4().hex}"
+        id_space = IdSpace.Temp
+        manager = self.tid_managers[id_space]
+        idx = manager.get_id()
+        slot = Slot(id_type=IdType.Tensor, id_space=id_space, idx=idx)
+        self.name_to_slot[name] = slot
+        return name, slot
 
     def make_or_get_slot(self, node, id_space: IdSpace = IdSpace.Temp) -> Union[Slot, Tuple[Slot]]:
         if node.name in self.name_to_slot:
@@ -537,6 +547,12 @@ class ProgramBuilder(OpsMixin):
     def _build_json(self):
         if self.prog_json is not None:
             return self.prog_json
+
+        # Check support
+        unsupported = {}
+        for node, info in self.node_info.items():
+            if not info.supported:
+                raise ValueError(f"Found unsupported node: {node}\nReason: {info.unsupported_reason}")
         
         # Loop through all instructions and 
         # find slots that are used

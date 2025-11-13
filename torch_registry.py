@@ -126,7 +126,7 @@ def view_handler(P: ProgramBuilder, n: Node) -> Slot:
     P.RESHAPE(x=x, out=out, shape=shape)
     return out
 
-@REGISTRY.register(target=[torch.ops.aten.clone.default])
+@REGISTRY.register(target=[torch.ops.aten.clone.default, torch.ops.aten.alias.default])
 def clone_handler(P: ProgramBuilder, n: Node) -> Slot:
     x, = P.args(n)
     out = P.make_or_get_slot(n)
@@ -185,13 +185,23 @@ def permute_handler(P: ProgramBuilder, n: Node) -> Slot:
     P.TRANSPOSE(x=x, out=out, perm=dims)
     return out
 
+@REGISTRY.register(target=[torch.ops.aten.transpose.int])
+def transpose_handler(P: ProgramBuilder, n: Node) -> Slot:
+    args = P.args(n)
+    x, dim0, dim1 = args
+
+    perm = list(range(len(n.meta["val"].shape)))
+    perm[dim0], perm[dim1] = perm[dim1], perm[dim0]
+
+    out = P.make_or_get_slot(n)
+    P.TRANSPOSE(x=x, out=out, perm=perm)
+    return out
+
 @REGISTRY.register(target=[torch.ops.aten.slice.Tensor])
 def slice_handler(P: ProgramBuilder, n: Node) -> Slot:
-    # print("HANDLING SLICE", n.args, n.kwargs)
     x, dim, start, end = P.args(n)
     if start is None:
         start = 0
-    # print("SLICE SLOTS", x, dim, start, end)
     out = P.make_or_get_slot(n)
     P.SLICE(x=x, out=out, axis=dim, start=start, end=end)
     return out
@@ -215,11 +225,110 @@ def silu_handler(P: ProgramBuilder, n: Node) -> Slot:
     P.SILU(x=x, out=out)
     return out
 
+@REGISTRY.register(target=[torch.ops.aten.gelu.default])
+def gelu_handler(P: ProgramBuilder, n: Node) -> Slot:
+    x = P.args(n)[0]
+    out = P.make_or_get_slot(n)
+    P.GELU(x=x, out=out)
+    return out
+
+@REGISTRY.register(target=[torch.ops.aten.layer_norm.default])
+def layer_norm_handler(P: ProgramBuilder, n: Node) -> Slot:
+    assert n.kwargs == {}
+    args = P.args(n)
+    x, shape = args[0:2]
+    if len(shape) > 1:
+        raise ValueError("LayerNorm is only supported when normalizing over the last dimension")
+    w = args[2] if len(args) > 2 else None
+    bias = args[3] if len(args) > 3 else None
+    eps = args[4] if len(args) > 4 else 1e-5
+
+    out = P.make_or_get_slot(n)
+    P.LAYER_NORM(x=x, out=out, weight=w, bias=bias, eps=eps)
+    return out
+
+@REGISTRY.register(target=[torch.ops.aten.arange.default])
+def arange_handler(P: ProgramBuilder, n: Node) -> Slot:
+    args = P.args(n)
+    if len(args) == 1:
+        start = 0
+        stop = args[0]
+    else:
+        start, stop = args[0:2]
+    step = args[2] if len(args) > 2 else 1
+
+    dtype = n.kwargs.get("dtype", None)
+    if dtype is not None:
+        dtype = str(_TORCH_DTYPE_TO_DTYPEID[dtype])
+
+    out = P.make_or_get_slot(n)
+    P.ARANGE(out=out, start=start, stop=stop, step=step, dtype=dtype)
+    return out
+
+
+# class FullNode:
+#     out: Tid
+#     shape: List[int]
+#     v: float
+#     dtype: DTypeId
+
 @REGISTRY.register(target=[torch.ops.aten.mul.Tensor])
 def mul_handler(P: ProgramBuilder, n: Node) -> Slot:
     a, b = P.args(n)
+
+    # TODO: do this in runtime
+    if isinstance(a, float):
+        _, tmp = P.slot_manager.make_tmp_slot()
+        dtype = str(DTypeId.f32)
+        P.FULL(out=tmp, shape=[1], v=a, dtype=dtype)
+        a = tmp
+    
+    if isinstance(b, float):
+        _, tmp = P.slot_manager.make_tmp_slot()
+        dtype = str(DTypeId.f32)
+        P.FULL(out=tmp, shape=[1], v=b, dtype=dtype)
+        b = tmp
+
     out = P.make_or_get_slot(n)
     P.MUL(a=a, b=b, out=out)
+    return out
+
+@REGISTRY.register(target=[torch.ops.aten.conv1d.default])
+def conv1d_handler(P: ProgramBuilder, n: Node) -> Slot:
+    x, w = n.args[0:2]
+    bias = n.args[2] if len(n.args) > 2 else None
+    stride = n.args[3] if len(n.args) > 3 else 1
+    if isinstance(stride, list):
+        assert len(stride) == 1
+        stride = stride[0]
+    padding = n.args[4] if len(n.args) > 4 else 0
+    if isinstance(padding, list):
+        assert len(padding) == 1
+        padding = padding[0]
+    dilation = n.args[5] if len(n.args) > 5 else 1
+    groups = n.args[6] if len(n.args) > 6 else 1
+
+
+    # [O, I/G, K] -> [O, K, I] : TODO: resolve I/G vs. I
+    w_target, w = P.get_placeholder_target_and_tensor(w)
+    w = P.make_or_get_constant(f"{w_target}_channel_last", w.permute([0, 2, 1]).contiguous())
+
+
+    x, bias, stride, padding, dilation, groups = P.slot_map([x, bias, stride, padding, dilation, groups])
+
+    tmp_name, tmp = P.slot_manager.make_tmp_slot()
+    P.TRANSPOSE(x=x, perm=(0, 2, 1), out=tmp) # (N, W, C_in)
+
+    P.CONV_1D(x=tmp, w=w, out=tmp, stride=stride, padding=padding, dilation=dilation, groups=groups)
+
+    if bias is not None:
+        tmp2_name, tmp2 = P.slot_manager.make_tmp_slot()
+        P.RESHAPE(x=bias, shape=[1, 1, -1], out=tmp2)
+        P.ADD(a=tmp, b=tmp2, out=tmp)
+
+    out = P.make_or_get_slot(n)
+    P.TRANSPOSE(x=tmp, perm=(0, 2, 1), out=out) # (N, C_out, W)
+
     return out
 
 @REGISTRY.register_pattern(name="SLICE_UPDATE")
@@ -324,14 +433,24 @@ class SDPAHandler(PatternHandler):
         self.v_node = v_node
     
     @classmethod
+    def _parse_sdpa_args_and_kwargs(cls, sdpa_node: Node):
+        q, k, v = sdpa_node.args[0:3]
+        attn_mask = sdpa_node.args[3] if len(sdpa_node.args) > 3 else None
+        dropout_p = sdpa_node.args[4] if len(sdpa_node.args) > 4 else 0.0
+        is_causal = sdpa_node.args[5] if len(sdpa_node.args) > 5 else False
+        enable_gqa = sdpa_node.args[6] if len(sdpa_node.args) > 6 else False
+        scale = sdpa_node.kwargs.get("scale", None)
+        return q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa
+    
+    @classmethod
     def maybe_create(cls, ep: ExportedProgram, head: Node) -> Optional[SliceUpdateHandler]:
         _op_namespace = torch.ops.aten
 
         sdpa_node = head
         if sdpa_node.target !=_op_namespace.scaled_dot_product_attention.default:
             return None
-        
-        q, k, v, attn_mask, is_causal, scale = sdpa_node.args
+
+        q, k, v, _, _, _, _, _ = cls._parse_sdpa_args_and_kwargs(sdpa_node)
 
         # Detect grouped kv attention pattern with repeat_interleave before SDPA
         is_grouped_kv = False
@@ -355,11 +474,7 @@ class SDPAHandler(PatternHandler):
     
     def __call__(self, P: ProgramBuilder, n: Node):
         assert n == self.head
-        # print("SDPA ARGS", n.args, n.kwargs)
-        q, k, v, attn_mask, dropout_p, is_causal = n.args[0:7]
-        enable_gqa = n.args[7] if len(n.args) > 7 else False
-        scale = n.kwargs.get("scale", None)
-
+        q, k, v, attn_mask, dropout_p, is_causal, scale, enable_gqa = SDPAHandler._parse_sdpa_args_and_kwargs(n)
         head_dim = q.meta["val"].shape[-1]
         if scale is None:
             scale = head_dim**-0.5

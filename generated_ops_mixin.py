@@ -23,6 +23,10 @@ class OpsMixin:
         payload = self._coerce_payload("RMS_NORM", locals())
         self._emit("RMS_NORM", **payload)
 
+    def LAYER_NORM(self, *, x: Any, out: Any, weight: Optional[Any], bias: Optional[Any], eps: float) -> None:
+        payload = self._coerce_payload("LAYER_NORM", locals())
+        self._emit("LAYER_NORM", **payload)
+
     def ROPE_APPLY(self, *, q_in: Any, k_in: Any, q_out: Any, k_out: Any, head_dim: int, pos: Any, freqs: Optional[Any], traditional: bool, base: Optional[float], scale: float) -> None:
         payload = self._coerce_payload("ROPE_APPLY", locals())
         self._emit("ROPE_APPLY", **payload)
@@ -46,6 +50,18 @@ class OpsMixin:
     def MUL(self, *, a: Any, b: Any, out: Any) -> None:
         payload = self._coerce_payload("MUL", locals())
         self._emit("MUL", **payload)
+
+    def CONV_1D(self, *, x: Any, w: Any, out: Any, stride: int, padding: int, dilation: int, groups: int) -> None:
+        payload = self._coerce_payload("CONV_1D", locals())
+        self._emit("CONV_1D", **payload)
+
+    def GELU(self, *, x: Any, out: Any) -> None:
+        payload = self._coerce_payload("GELU", locals())
+        self._emit("GELU", **payload)
+
+    def ARANGE(self, *, out: Any, start: int, stop: int, step: int, dtype: Optional[DTypeId | str]) -> None:
+        payload = self._coerce_payload("ARANGE", locals())
+        self._emit("ARANGE", **payload)
 
     def SILU(self, *, x: Any, out: Any) -> None:
         payload = self._coerce_payload("SILU", locals())
