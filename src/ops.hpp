@@ -38,10 +38,42 @@ struct LinearNode {
   std::optional<Tid> bias { std::nullopt };
 };
 
+struct ItemIntNode {
+  Tid x { Tid{} };
+  Vid<int> out { Vid<int>{} };
+};
+
+struct ExpandDimsNode {
+  Tid x { Tid{} };
+  Tid out { Tid{} };
+  int axis {};
+};
+
+struct TileNode {
+  Tid x { Tid{} };
+  Tid out { Tid{} };
+  std::vector<int> reps {};
+};
+
+struct TakeAlongAxisNode {
+  Tid x { Tid{} };
+  Tid indices { Tid{} };
+  Tid out { Tid{} };
+  int axis {};
+};
+
 struct RMSNormNode {
   Tid x { Tid{} };
   Tid weight { Tid{} };
   Tid out { Tid{} };
+  float eps {};
+};
+
+struct LayerNormNode {
+  Tid x { Tid{} };
+  Tid out { Tid{} };
+  std::optional<Tid> weight { std::nullopt };
+  std::optional<Tid> bias { std::nullopt };
   float eps {};
 };
 
@@ -90,6 +122,29 @@ struct MulNode {
   Tid a { Tid{} };
   Tid b { Tid{} };
   Tid out { Tid{} };
+};
+
+struct Conv1DNode {
+  Tid x { Tid{} };
+  Tid w { Tid{} };
+  Tid out { Tid{} };
+  int stride {};
+  int padding {};
+  int dilation {};
+  int groups {};
+};
+
+struct GeluNode {
+  Tid x { Tid{} };
+  Tid out { Tid{} };
+};
+
+struct ARangeNode {
+  Tid out { Tid{} };
+  int start {};
+  int stop {};
+  int step {};
+  std::optional<DTypeId> dtype { std::nullopt };
 };
 
 struct SiluNode {
@@ -211,13 +266,21 @@ struct QuantizedGatherNode {
 #define OP_LIST(X) \
   X(NOOP, NoopNode) \
   X(LINEAR, LinearNode) \
+  X(ITEM_INT, ItemIntNode) \
+  X(EXPAND_DIMS, ExpandDimsNode) \
+  X(TILE, TileNode) \
+  X(TAKE_ALONG_AXIS, TakeAlongAxisNode) \
   X(RMS_NORM, RMSNormNode) \
+  X(LAYER_NORM, LayerNormNode) \
   X(ROPE_APPLY, RopeNode) \
   X(SDPA, SdpaNode) \
   X(ADD, AddNode) \
   X(ADD_SCALAR, AddScalarNode) \
   X(SYM_SIZE, SymSizeNode) \
   X(MUL, MulNode) \
+  X(CONV_1D, Conv1DNode) \
+  X(GELU, GeluNode) \
+  X(ARANGE, ARangeNode) \
   X(SILU, SiluNode) \
   X(RESHAPE, ReshapeNode) \
   X(TRANSPOSE, TransposeNode) \
@@ -256,13 +319,21 @@ using OpPayloadT = typename OpPayload<OC>::type;
 using NodeVariant = std::variant<
   NoopNode,
   LinearNode,
+  ItemIntNode,
+  ExpandDimsNode,
+  TileNode,
+  TakeAlongAxisNode,
   RMSNormNode,
+  LayerNormNode,
   RopeNode,
   SdpaNode,
   AddNode,
   AddScalarNode,
   SymSizeNode,
   MulNode,
+  Conv1DNode,
+  GeluNode,
+  ARangeNode,
   SiluNode,
   ReshapeNode,
   TransposeNode,
@@ -285,13 +356,21 @@ using NodeVariant = std::variant<
 enum : size_t {
   VAR_IDX_NOOP,
   VAR_IDX_LINEAR,
+  VAR_IDX_ITEM_INT,
+  VAR_IDX_EXPAND_DIMS,
+  VAR_IDX_TILE,
+  VAR_IDX_TAKE_ALONG_AXIS,
   VAR_IDX_RMS_NORM,
+  VAR_IDX_LAYER_NORM,
   VAR_IDX_ROPE_APPLY,
   VAR_IDX_SDPA,
   VAR_IDX_ADD,
   VAR_IDX_ADD_SCALAR,
   VAR_IDX_SYM_SIZE,
   VAR_IDX_MUL,
+  VAR_IDX_CONV_1D,
+  VAR_IDX_GELU,
+  VAR_IDX_ARANGE,
   VAR_IDX_SILU,
   VAR_IDX_RESHAPE,
   VAR_IDX_TRANSPOSE,
@@ -314,13 +393,21 @@ enum : size_t {
 template <OpCode> struct OpVariantIndex;
 template <> struct OpVariantIndex<OpCode::NOOP> { static constexpr size_t value = VAR_IDX_NOOP; };
 template <> struct OpVariantIndex<OpCode::LINEAR> { static constexpr size_t value = VAR_IDX_LINEAR; };
+template <> struct OpVariantIndex<OpCode::ITEM_INT> { static constexpr size_t value = VAR_IDX_ITEM_INT; };
+template <> struct OpVariantIndex<OpCode::EXPAND_DIMS> { static constexpr size_t value = VAR_IDX_EXPAND_DIMS; };
+template <> struct OpVariantIndex<OpCode::TILE> { static constexpr size_t value = VAR_IDX_TILE; };
+template <> struct OpVariantIndex<OpCode::TAKE_ALONG_AXIS> { static constexpr size_t value = VAR_IDX_TAKE_ALONG_AXIS; };
 template <> struct OpVariantIndex<OpCode::RMS_NORM> { static constexpr size_t value = VAR_IDX_RMS_NORM; };
+template <> struct OpVariantIndex<OpCode::LAYER_NORM> { static constexpr size_t value = VAR_IDX_LAYER_NORM; };
 template <> struct OpVariantIndex<OpCode::ROPE_APPLY> { static constexpr size_t value = VAR_IDX_ROPE_APPLY; };
 template <> struct OpVariantIndex<OpCode::SDPA> { static constexpr size_t value = VAR_IDX_SDPA; };
 template <> struct OpVariantIndex<OpCode::ADD> { static constexpr size_t value = VAR_IDX_ADD; };
 template <> struct OpVariantIndex<OpCode::ADD_SCALAR> { static constexpr size_t value = VAR_IDX_ADD_SCALAR; };
 template <> struct OpVariantIndex<OpCode::SYM_SIZE> { static constexpr size_t value = VAR_IDX_SYM_SIZE; };
 template <> struct OpVariantIndex<OpCode::MUL> { static constexpr size_t value = VAR_IDX_MUL; };
+template <> struct OpVariantIndex<OpCode::CONV_1D> { static constexpr size_t value = VAR_IDX_CONV_1D; };
+template <> struct OpVariantIndex<OpCode::GELU> { static constexpr size_t value = VAR_IDX_GELU; };
+template <> struct OpVariantIndex<OpCode::ARANGE> { static constexpr size_t value = VAR_IDX_ARANGE; };
 template <> struct OpVariantIndex<OpCode::SILU> { static constexpr size_t value = VAR_IDX_SILU; };
 template <> struct OpVariantIndex<OpCode::RESHAPE> { static constexpr size_t value = VAR_IDX_RESHAPE; };
 template <> struct OpVariantIndex<OpCode::TRANSPOSE> { static constexpr size_t value = VAR_IDX_TRANSPOSE; };

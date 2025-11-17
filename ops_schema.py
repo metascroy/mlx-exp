@@ -89,6 +89,33 @@ class LinearNode:
     out: Tid
     bias: Optional[Tid]
 
+@op("ITEM_INT")
+@dataclass
+class ItemIntNode:
+    x: Tid
+    out: Vid[int]
+
+@op("EXPAND_DIMS")
+@dataclass
+class ExpandDimsNode:
+    x: Tid
+    out: Tid
+    axis: int
+
+@op("TILE")
+@dataclass
+class TileNode:
+    x: Tid
+    out: Tid
+    reps: List[int]
+
+@op("TAKE_ALONG_AXIS")
+@dataclass
+class TakeAlongAxisNode:
+    x: Tid
+    indices: Tid
+    out: Tid
+    axis: int
 
 @op("RMS_NORM")
 @dataclass
@@ -98,6 +125,14 @@ class RMSNormNode:
     out: Tid
     eps: float
 
+@op("LAYER_NORM")
+@dataclass
+class LayerNormNode:
+    x: Tid
+    out: Tid
+    weight: Optional[Tid]
+    bias: Optional[Tid]
+    eps: float
 
 @op("ROPE_APPLY")
 @dataclass
@@ -152,6 +187,32 @@ class MulNode:
     a: Tid
     b: Tid
     out: Tid
+
+@op("CONV_1D")
+@dataclass
+class Conv1DNode:
+    x: Tid
+    w: Tid
+    out: Tid
+    stride: int
+    padding: int
+    dilation: int
+    groups: int
+
+@op("GELU")
+@dataclass
+class GeluNode:
+    x: Tid
+    out: Tid
+
+@op("ARANGE")
+@dataclass
+class ARangeNode:
+    out: Tid
+    start: int
+    stop: int
+    step: int
+    dtype: Optional[DTypeId]
 
 @op("SILU")
 @dataclass

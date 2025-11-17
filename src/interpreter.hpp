@@ -11,17 +11,70 @@
 #include "ops.hpp"
 #include "program.hpp"
 
+#include <mlx/mlx.h>
 #include <mlx/array.h>
 #include <mlx/ops.h>
 #include <mlx/fast.h>
-#include <iostream> // @nocommit
+#include <iostream>
 
 namespace executorch::mlx {
 
+// Enable/disable operation logging for debugging
+// Set to true to see detailed operation-level logs with tensor statistics
+constexpr bool kEnableLogging = false;
+
+static ::mlx::core::array gelu_impl(const ::mlx::core::array& x, ::mlx::core::StreamOrDevice s = {}) {
+    using namespace ::mlx::core;
+    constexpr float sqrt_2_over_pi = 0.7978845608f;
+    auto dtype = x.dtype();
+
+    auto x3   = multiply(x, multiply(x, x, s), s);
+    auto term = multiply(array(0.044715f, dtype), x3, s);
+    auto inner = add(x, term, s);
+    inner = multiply(array(sqrt_2_over_pi, dtype), inner, s);
+    auto tanh_val = tanh(inner, s);
+    auto one_plus_tanh = add(array(1.0f, dtype), tanh_val, s);
+    auto out = multiply(x, one_plus_tanh, s);
+    out = multiply(array(0.5f, dtype), out, s);
+    return out;
+}
+
+// Wrapper for compile API which requires vector<array> -> vector<array>
+static std::vector<::mlx::core::array> gelu_impl_vectorized(const std::vector<::mlx::core::array>& inputs) {
+    return {gelu_impl(inputs[0])};
+}
+
+inline auto& gelu_compiled() {
+    static auto fn = ::mlx::core::compile(
+        gelu_impl_vectorized,  // Use the vectorized wrapper
+        /*shapeless=*/true
+    );
+    return fn;
+}
+
 
 static inline void log_op(const executorch::mlx::ExecutionState& st, Tid id, std::string name) {
-  // auto out = st.const_tensor_ref(id);
-  // std::cout << "OP " << name << " (" << out.shape() << "): " << out << "\n";
+  if constexpr (!kEnableLogging) return;
+
+  auto out = st.const_tensor_ref(id);
+  std::cout << "OP " << name << " (" << out.shape() << ") (tid=" << id.idx << ")\n";
+  // Print first few values for small tensors
+  if (out.size() <= 10) {
+    std::cout << "  values: " << out << "\n";
+  } else {
+    // For larger tensors, print shape and statistics
+    std::cout << "  min=" << ::mlx::core::min(out).item<float>()
+              << ", max=" << ::mlx::core::max(out).item<float>()
+              << ", mean=" << ::mlx::core::mean(out).item<float>() << "\n";
+  }
+}
+
+template <typename T>
+static inline void log_op(const executorch::mlx::ExecutionState& st, Vid<T> id, std::string name) {
+  if constexpr (!kEnableLogging) return;
+
+  auto out = st.const_value_ref<T>(id);
+  std::cout << "OP " << name << ": " << out << " (vid=" << id.idx << ")\n";
 }
 
 
@@ -374,11 +427,92 @@ static void op_ROPE_APPLY(const Instr& ins, const Program& prog, ExecutionState&
   impl::do_rope(prog, st, ins.get<RopeNode>(), s);
 }
 
-static void op_ADD(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+static void op_CONV_1D(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
-  const auto& n = ins.get<AddNode>();
-  set_output(st, n.out, add(st.const_tensor_ref(n.a), st.const_tensor_ref(n.b), s));
-  log_op(st, n.out, "ADD");
+  const auto& n = ins.get<Conv1DNode>();
+  const auto& x = st.const_tensor_ref(n.x);
+  const auto& w = st.const_tensor_ref(n.w);
+  log_op(st, n.x, "CONV_1D_IN");
+  auto out = conv1d(x, w, n.stride, n.padding, n.dilation, n.groups, s);
+  set_output(st, n.out, out);
+  log_op(st, n.out, "CONV_1D");
+}
+
+static void op_LAYER_NORM(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+  using namespace ::mlx::core;
+  using namespace ::mlx::core::fast;
+
+  const auto& n = ins.get<LayerNormNode>();
+  const auto& x = st.const_tensor_ref(n.x);
+
+  std::optional<array> w = std::nullopt;
+  if (n.weight) {
+    w = st.const_tensor_ref(*n.weight);
+  }
+  std::optional<array> bias = std::nullopt;
+  if (n.bias) {
+    bias = st.const_tensor_ref(*n.bias);
+  }
+  auto out = layer_norm(x, w, bias, n.eps, s);
+  set_output(st, n.out, out);
+  log_op(st, n.out, "LAYER_NORM");
+}
+
+static void op_GELU(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+  using namespace ::mlx::core;
+  const auto& n = ins.get<GeluNode>();
+  const auto& x = st.const_tensor_ref(n.x);
+
+  // The compiled version of GELU is slower than non-compiled (or at least no faster)
+  // // Use compiled GELU for potential performance improvement
+  // // mlx::compile expects vector<array> input/output
+  // auto& gelu_fn = gelu_compiled();
+  // auto out = gelu_fn({x})[0];
+
+  // Non-compiled version
+  auto out = gelu_impl(x, s);
+
+  set_output(st, n.out, out);
+  log_op(st, n.out, "GELU");
+}
+
+static void op_ARANGE(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+  using namespace ::mlx::core;
+  const auto& n = ins.get<ARangeNode>();
+  auto dtype = int32;
+  if (n.dtype) {
+    dtype = to_dtype(*n.dtype);
+  }
+  set_output(st, n.out, arange(n.start, n.stop, n.step, dtype, s));
+  log_op(st, n.out, "ARANGE");
+}
+
+static void op_EXPAND_DIMS(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+  using namespace ::mlx::core;
+  const auto& n = ins.get<ExpandDimsNode>();
+  set_output(st, n.out, expand_dims(st.const_tensor_ref(n.x), n.axis, s));
+  log_op(st, n.out, "EXPAND_DIMS");
+}
+
+static void op_TAKE_ALONG_AXIS(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+  using namespace ::mlx::core;
+  const auto& n = ins.get<TakeAlongAxisNode>();
+  set_output(st, n.out, take_along_axis(st.const_tensor_ref(n.x), st.const_tensor_ref(n.indices), n.axis, s));
+  log_op(st, n.out, "TAKE_ALONG_AXIS");
+}
+
+static void op_ITEM_INT(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+  using namespace ::mlx::core;
+  const auto& n = ins.get<ItemIntNode>();
+  int item = st.const_tensor_ref(n.x).item<int>();
+  st.values[n.out.idx] = item;
+}
+
+static void op_TILE(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+  using namespace ::mlx::core;
+  const auto& n = ins.get<TileNode>();
+  set_output(st, n.out, tile(st.const_tensor_ref(n.x), n.reps, s));
+  log_op(st, n.out, "TILE");
 }
 
 static void op_ADD_SCALAR(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
@@ -410,6 +544,14 @@ static void op_SYM_SIZE(const Instr& ins,
   int32_t size = static_cast<int32_t>(a.shape()[dim]);
 
   st.values[n.out.idx] = size;
+  log_op<int>(st, n.out, "SYM_SIZE");
+}
+
+static void op_ADD(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
+  using namespace ::mlx::core;
+  const auto& n = ins.get<AddNode>();
+  set_output(st, n.out, add(st.const_tensor_ref(n.a), st.const_tensor_ref(n.b), s));
+  log_op(st, n.out, "ADD");
 }
 
 static void op_MUL(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
@@ -431,16 +573,19 @@ static void op_RESHAPE(const Instr& ins, const Program&, ExecutionState& st, Str
   const auto& n = ins.get<ReshapeNode>();
   auto new_shape = to_shape(n.shape, st);
   set_output(st, n.out, reshape(st.const_tensor_ref(n.x), new_shape));
+  log_op(st, n.out, "RESHAPE");
 }
 static void op_TRANSPOSE(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<TransposeNode>();
   set_output(st, n.out, transpose(st.const_tensor_ref(n.x), n.perm, s));
+  log_op(st, n.out, "TRANSPOSE");
 }
 static void op_CONTIGUOUS(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
   using namespace ::mlx::core;
   const auto& n = ins.get<ContigNode>();
-  set_output(st, n.out, copy(st.const_tensor_ref(n.x), s));
+  set_output(st, n.out, contiguous(st.const_tensor_ref(n.x), false, s));
+  log_op(st, n.out, "CONTIGUOUS");
 }
 
 static void op_GATHER(const Instr& ins, const Program&, ExecutionState& st, StreamOrDevice s) {
