@@ -46,4 +46,4 @@ After this runs, the output will be present in output_ids.txt.  This can be deco
 
 2. Run whisper prog in python to export example data and get ground truth for C++: `python run_whisper.py`
 
-3. Run in C++: `sh build_and_run_whisper.sh`.  You might need to adjust the model paths to point to the program/data paths from steps 1/2.
+3. Run in C++: `sh build_and_run_whisper.sh`.  You might need to adjust the model paths in src/main_whisper.cpp to point to the program/data paths from steps 1/2.
