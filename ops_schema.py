@@ -89,6 +89,33 @@ class LinearNode:
     out: Tid
     bias: Optional[Tid]
 
+@op("ITEM_INT")
+@dataclass
+class ItemIntNode:
+    x: Tid
+    out: Vid[int]
+
+@op("EXPAND_DIMS")
+@dataclass
+class ExpandDimsNode:
+    x: Tid
+    out: Tid
+    axis: int
+
+@op("TILE")
+@dataclass
+class TileNode:
+    x: Tid
+    out: Tid
+    reps: List[int]
+
+@op("TAKE_ALONG_AXIS")
+@dataclass
+class TakeAlongAxisNode:
+    x: Tid
+    indices: Tid
+    out: Tid
+    axis: int
 
 @op("RMS_NORM")
 @dataclass

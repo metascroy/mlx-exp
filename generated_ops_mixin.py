@@ -19,6 +19,22 @@ class OpsMixin:
         payload = self._coerce_payload("LINEAR", locals())
         self._emit("LINEAR", **payload)
 
+    def ITEM_INT(self, *, x: Any, out: Any) -> None:
+        payload = self._coerce_payload("ITEM_INT", locals())
+        self._emit("ITEM_INT", **payload)
+
+    def EXPAND_DIMS(self, *, x: Any, out: Any, axis: int) -> None:
+        payload = self._coerce_payload("EXPAND_DIMS", locals())
+        self._emit("EXPAND_DIMS", **payload)
+
+    def TILE(self, *, x: Any, out: Any, reps: List[int]) -> None:
+        payload = self._coerce_payload("TILE", locals())
+        self._emit("TILE", **payload)
+
+    def TAKE_ALONG_AXIS(self, *, x: Any, indices: Any, out: Any, axis: int) -> None:
+        payload = self._coerce_payload("TAKE_ALONG_AXIS", locals())
+        self._emit("TAKE_ALONG_AXIS", **payload)
+
     def RMS_NORM(self, *, x: Any, weight: Any, out: Any, eps: float) -> None:
         payload = self._coerce_payload("RMS_NORM", locals())
         self._emit("RMS_NORM", **payload)

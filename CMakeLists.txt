@@ -34,7 +34,7 @@ if (NOT TARGET nlohmann_json::nlohmann_json)
   FetchContent_MakeAvailable(nlohmann_json)
 endif()
 
-add_executable(run_llm src/main.cpp)
+add_executable(run_llm src/main_llama.cpp)
 target_link_libraries(run_llm PRIVATE mlx)
 target_include_directories(run_llm PRIVATE third-party/mlx/include)
 

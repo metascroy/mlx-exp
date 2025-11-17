@@ -101,7 +101,6 @@ def embedding_handler(P: ProgramBuilder, n: Node) -> Slot:
     assert len(n.kwargs) == 0, f"Got unexpected kwargs={kwargs}"
     args = P.args(n)
     w, x = args[0], args[1]
-    # print("EMBEDDING ARGS", n.args, n.kwargs)
     out = P.make_or_get_slot(n)
     P.GATHER(table=w, ids=x, out=out)
     return out
@@ -115,12 +114,10 @@ def rms_norm_handler(P: ProgramBuilder, n: Node) -> Slot:
         eps = args[2]
     out = P.make_or_get_slot(n)
     P.RMS_NORM(x=x, weight=w, out=out, eps=eps)
-    # print("IN RMS NORM", "x", x, "w", w, "out", out)
     return out
 
 @REGISTRY.register(target=[torch.ops.aten.view.default])
 def view_handler(P: ProgramBuilder, n: Node) -> Slot:
-    # print("VIEW ARGS", n.args, n.kwargs)
     x, shape = P.args(n)
     out = P.make_or_get_slot(n)
     P.RESHAPE(x=x, out=out, shape=shape)
@@ -150,6 +147,38 @@ def add_handler(P: ProgramBuilder, n: Node) -> Slot:
     a, b = P.args(n)
     out = P.make_or_get_slot(n)
     P.ADD(a=a, b=b, out=out)
+    return out
+
+@REGISTRY.register(target=[torch.ops.aten.item.default])
+def item_handler(P: ProgramBuilder, n: Node) -> Slot:
+    if not isinstance(n.meta["val"], torch.SymInt):
+        raise ValueError("item only supported if it returns a SymInt")
+    x = P.args(n)
+    out = P.make_or_get_slot(n)
+    P.ITEM_INT(x=x, out=out)
+    return out
+
+@REGISTRY.register(target=[torch.ops.aten.unsqueeze.default])
+def unqueeze_handler(P: ProgramBuilder, n: Node) -> Slot:
+    x, axis = P.args(n)
+    out = P.make_or_get_slot(n)
+    P.EXPAND_DIMS(x=x, out=out, axis=axis)
+    return out
+
+@REGISTRY.register(target=[torch.ops.aten.repeat.default])
+def repeat_handler(P: ProgramBuilder, n: Node) -> Slot:
+    x, reps = P.args(n)
+    out = P.make_or_get_slot(n)
+    P.TILE(x=x, reps=reps, out=out)
+    return out
+
+@REGISTRY.register(target=[torch.ops.aten.index.Tensor])
+def index_handler(P: ProgramBuilder, n: Node) -> Slot:
+    x, idx_list = P.args(n)
+    assert isinstance(idx_list, list)
+    assert len(idx_list) == 1
+    out = P.make_or_get_slot(n)
+    P.TAKE_ALONG_AXIS(x=x, indices=idx_list[0], out=out, axis=0)
     return out
 
 @REGISTRY.register(target=[operator.add])
@@ -265,13 +294,6 @@ def arange_handler(P: ProgramBuilder, n: Node) -> Slot:
     P.ARANGE(out=out, start=start, stop=stop, step=step, dtype=dtype)
     return out
 
-
-# class FullNode:
-#     out: Tid
-#     shape: List[int]
-#     v: float
-#     dtype: DTypeId
-
 @REGISTRY.register(target=[torch.ops.aten.mul.Tensor])
 def mul_handler(P: ProgramBuilder, n: Node) -> Slot:
     a, b = P.args(n)
@@ -279,13 +301,13 @@ def mul_handler(P: ProgramBuilder, n: Node) -> Slot:
     # TODO: do this in runtime
     if isinstance(a, float):
         _, tmp = P.slot_manager.make_tmp_slot()
-        dtype = str(DTypeId.f32)
+        dtype = str(_TORCH_DTYPE_TO_DTYPEID[n.meta["val"].dtype])
         P.FULL(out=tmp, shape=[1], v=a, dtype=dtype)
         a = tmp
     
     if isinstance(b, float):
         _, tmp = P.slot_manager.make_tmp_slot()
-        dtype = str(DTypeId.f32)
+        dtype = str(_TORCH_DTYPE_TO_DTYPEID[n.meta["val"].dtype])
         P.FULL(out=tmp, shape=[1], v=b, dtype=dtype)
         b = tmp
 
@@ -417,8 +439,6 @@ class SliceUpdateHandler(PatternHandler):
         assert n == self.head
         kwargs = P.slot_map({k:getattr(self, k) for k in ["dst", "update", "axis", "start", "stop"]})
         P.SLICE_UPDATE(**kwargs)
-        # print("RETURNING DST FROM SLICE UPDATE", kwargs["dst"])
-
         P.set_slot(n, kwargs["dst"])
         return kwargs["dst"]
 
@@ -485,7 +505,6 @@ class SDPAHandler(PatternHandler):
 
         assert dropout_p == 0.0
         
-        # print("CREATING SDPA WITH FOLLOWING Q, K, V", q.meta["val"].shape, k.meta["val"].shape, v.meta["val"].shape)
         q, k, v, attn_mask = P.slot_map([q, k, v, attn_mask])
         out = P.make_or_get_slot(n)
         P.SDPA(q=q, k=k, v=v, out=out, scale=scale, mask=attn_mask, causal=is_causal)

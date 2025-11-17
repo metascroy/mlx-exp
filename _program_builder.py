@@ -431,7 +431,10 @@ class ProgramBuilder(OpsMixin):
                     if target in output_kind_targets[OutputKind.BUFFER_MUTATION]:
                         mutable_buffers.append(name)
                     else:
-                        constant_tensors.append(name)
+                        # Non-mutated buffers should still be mutable buffers, not constants
+                        # Buffers are not saved to safetensors, so they cannot be constants
+                        # TODO: maybe call list "buffers" instead of "mutable_buffers"?
+                        mutable_buffers.append(name)
                 elif kind == InputKind.USER_INPUT:
                     user_inputs.append(name)
                 elif kind == InputKind.CONSTANT_TENSOR:

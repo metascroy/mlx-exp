@@ -6,7 +6,8 @@ set -euo pipefail
 # ------------------------------------------------------------
 BUILD_DIR="build"
 BUILD_TYPE="Release"
-GENERATOR="Ninja"     # or "Unix Makefiles" if you prefer
+# GENERATOR="Unix Makefiles"     # or "Ninja" if you prefer
+GENERATOR="Ninja"
 RUN_TARGET="run_whisper"  # executable name from CMakeLists.txt
 
 # ------------------------------------------------------------

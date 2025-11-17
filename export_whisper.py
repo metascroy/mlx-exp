@@ -1,481 +1,781 @@
-# whisper_export.py
 import logging
-from typing import Dict
+from typing import Dict, Optional, Any, Tuple
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 from torch.export import ExportedProgram
 from torch.nn.attention import SDPBackend
-from transformers import AutoProcessor, WhisperForConditionalGeneration
-from program_builder import ProgramBuilder
+from transformers import (
+    AutoProcessor,
+    EncoderDecoderCache,
+    StaticCache,
+    WhisperForConditionalGeneration,
+    CacheLayerMixin,
+    Cache,
+    PretrainedConfig,
+)
+from transformers.utils import is_torchdynamo_compiling
+from transformers.integrations.sdpa_attention import sdpa_attention_forward
+from transformers.modeling_utils import AttentionInterface
 
-from datasets import load_dataset, Audio as HFAudio
-import soundfile as sf
-import numpy as np
+logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------
-# Shared helpers (ported from your Llama example)
-# ---------------------------------------------------------------------
+QUANTIZE = True
+DEFAULT_EXPORT_KWARGS = {
+    "batch_size": 1,
+    "max_decoder_seq_len": 256,
+    # FP32 runs faster than BF16 in MLX when not quantized, needs investigation
+    "model_dtype": {True: torch.bfloat16, False: torch.float32}[QUANTIZE],
+    "quantize": QUANTIZE,
+}
 
-
-def kv_update_and_window_checked_inplace(
-    k_cache: torch.Tensor,  # [B, Hkv, T_max, D]
-    v_cache: torch.Tensor,  # [B, Hkv, T_max, D]
-    k_step: torch.Tensor,   # [B, Hkv, T_step, D]
-    v_step: torch.Tensor,   # [B, Hkv, T_step, D]
-    input_pos: int,
-):
-    B, Hkv, T_max, D = k_cache.shape
-    _, _, T_step, _ = k_step.shape
-
-    writable = T_step
-    if writable > 0:
-        k_cache[:, :, input_pos:input_pos + writable, :].copy_(
-            k_step[:, :, :writable, :]
-        )
-        v_cache[:, :, input_pos:input_pos + writable, :].copy_(
-            v_step[:, :, :writable, :]
-        )
-
-    end = input_pos + T_step
-    k_win = k_cache[:, :, 0:end, :]
-    v_win = v_cache[:, :, 0:end, :]
-    return k_win, v_win
-
-
-def _get_attr_any(obj, *names, default=None):
-    for n in names:
-        if hasattr(obj, n):
-            return getattr(obj, n)
-    return default
-
-
-def _infer_heads_dims(
-    attn_module: nn.Module,
-    fallback_hidden_size: int,
-    fallback_num_heads: int,
-    fallback_num_kv_heads: int,
-):
-    q_proj = _get_attr_any(attn_module, "q_proj")
-    hidden_size = None
-    if q_proj is not None and hasattr(q_proj, "out_features"):
-        try:
-            hidden_size = int(q_proj.out_features)
-        except Exception:
-            hidden_size = None
-    if hidden_size is None:
-        hidden_size = int(
-            _get_attr_any(attn_module, "hidden_size", default=fallback_hidden_size)
-        )
-
-    num_heads = _get_attr_any(attn_module, "num_heads")
-    if num_heads is None:
-        num_heads = fallback_num_heads
-    num_heads = int(num_heads)
-
-    num_kv_heads = _get_attr_any(attn_module, "num_key_value_heads", "n_kv_heads")
-    if num_kv_heads is None:
-        num_kv_heads = fallback_num_kv_heads
-    num_kv_heads = int(num_kv_heads)
-
-    head_dim = _get_attr_any(attn_module, "head_dim")
-    if head_dim is None:
-        head_dim = hidden_size // max(1, num_heads)
-    head_dim = int(head_dim)
-    return hidden_size, num_heads, num_kv_heads, head_dim
-
-
-# ---------------------------------------------------------------------
-# Encoder wrapper (audio -> hidden states)
-# ---------------------------------------------------------------------
-
-
-class WhisperEncoderExportable(nn.Module):
+class WhisperCacheLayer(CacheLayerMixin):
     """
-    Wraps Whisper encoder for torch.export.
-    Input:  input_features (B, feature_size, nb_max_frames)
-    Output: last_hidden_state (B, T_enc, H)
+    Static KV cache layer for Whisper.
+
+    - Backing storage: [batch_size, num_heads, max_cache_len, head_dim]
+    - Uses `narrow(...).copy_` for updates.
+    - `cache_position` is a 1D tensor; we call `.item()` on it and
+      `torch._check_is_size(start)` exactly as you specified.
     """
 
-    def __init__(self, model: WhisperForConditionalGeneration):
+    is_compileable = True
+    is_sliding = False
+
+    def __init__(self, max_cache_len: int):
         super().__init__()
-        self.encoder = model.get_encoder()
-        self.config = self.encoder.config
-        self.model_device = model.device
-        self.model_dtype = model.dtype
+        self.max_cache_len = max_cache_len
+        # Filled on lazy_initialization
+        self.max_batch_size: int = 0
+        self.num_heads: int = 0
+        self.head_dim: int = 0
+        self.dtype: torch.dtype = torch.float32
+        self.device: torch.device = torch.device("cpu")
 
-    def forward(self, input_features: torch.FloatTensor):
+    # ------------------------------------------------------------------
+    # Required abstract methods
+    # ------------------------------------------------------------------
+
+    def lazy_initialization(self, key_states: torch.Tensor) -> None:
+        """
+        Allocate static backing tensors using the first key_states call to
+        infer batch size, num heads, head dim, dtype and device.
+
+        key_states: (B, H, L, D)
+        """
+        self.max_batch_size, self.num_heads, _, self.head_dim = key_states.shape
+        self.dtype, self.device = key_states.dtype, key_states.device
+
+        self.keys = torch.zeros(
+            (self.max_batch_size, self.num_heads, self.max_cache_len, self.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+        self.values = torch.zeros(
+            (self.max_batch_size, self.num_heads, self.max_cache_len, self.head_dim),
+            dtype=self.dtype,
+            device=self.device,
+        )
+
+        if not is_torchdynamo_compiling():
+            torch._dynamo.mark_static_address(self.keys)
+            torch._dynamo.mark_static_address(self.values)
+
+        self.is_initialized = True
+
+    def update(
+        self,
+        key_states: torch.Tensor,    # (B, H, L, D)
+        value_states: torch.Tensor,  # (B, H, L, D)
+        cache_kwargs: Optional[dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        cache_kwargs may contain:
+          * cache_position: a 1D tensor giving the start index in the cache
+            for this block of L tokens.
+
+        This follows your pattern exactly:
+          - cache_position is a 1D tensor
+          - we call `.item()` on it
+          - we call `torch._check_is_size(start)`
+          - we use narrow(...).copy_
+        """
+        # Lazy init if needed (mirrors StaticLayer behavior)
+        if not self.is_initialized:
+            self.lazy_initialization(key_states)
+
+        cache_position = None
+        if cache_kwargs is not None:
+            cache_position = cache_kwargs.get("cache_position", None)
+
+        # DO NOT reassign self.keys / self.values — keep aliasing with
+        # any registered buffers intact.
+        k_out = self.keys
+        v_out = self.values
+
+        if cache_position is None:
+            # Cross-attention (or full overwrite) path.
+            # Copy the whole sequence into the layer cache; we assume
+            # key_states.shape[-2] <= max_cache_len.
+            L = key_states.shape[-2]
+            k_out.narrow(2, 0, L).copy_(key_states)
+            v_out.narrow(2, 0, L).copy_(value_states)
+        else:
+            # Self-attention path: cache_position is the start index
+            # for a contiguous block of L tokens.
+            L = key_states.shape[-2]
+
+            # cache_position is a 1D tensor; use .item() and _check_is_size
+            assert isinstance(cache_position, torch.Tensor), "cache_position must be a tensor"
+            torch._check(cache_position.numel() == 1)
+            start = cache_position.item()
+            torch._check_is_size(start)
+
+            k_slice = k_out.narrow(2, start, L)
+            v_slice = v_out.narrow(2, start, L)
+
+            k_slice.copy_(key_states)
+            v_slice.copy_(value_states)
+
+        return k_out, v_out
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> Tuple[int, int]:
+        """
+        For a static cache, we can just mirror StaticLayer semantics:
+          kv_offset = 0
+          kv_length = max_cache_len
+        """
+        kv_offset = 0
+        kv_length = self.max_cache_len
+        return kv_length, kv_offset
+
+    def get_seq_length(self) -> int:
+        """
+        Approximate occupied length by counting non-zero positions along
+        time dim for the first (batch, head), same as StaticLayer.
+        """
+        if not self.is_initialized or self.keys.numel() == 0:
+            return 0
+        return (self.keys[0, 0].any(dim=-1)).sum().item()
+
+    def get_max_cache_shape(self) -> int:
+        return self.max_cache_len
+
+
+class WhisperCache(Cache):
+    """
+    Static cache for Whisper using WhisperCacheLayer per layer.
+
+    You can use this both for:
+      - self-attention  (max_cache_len = max_decoder_seq_len)
+      - cross-attention (max_cache_len = encoder_seq_len)
+    """
+
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        max_cache_len: int,
+        offloading: bool = False,
+        offload_only_non_sliding: bool = True,
+    ):
+        decoder_config = config.get_text_config(decoder=True)
+
+        num_layers = decoder_config.num_hidden_layers
+        if hasattr(decoder_config, "num_kv_shared_layers"):
+            num_layers = num_layers - decoder_config.num_kv_shared_layers
+
+        layers: list[CacheLayerMixin] = [
+            WhisperCacheLayer(max_cache_len=max_cache_len)
+            for _ in range(num_layers)
+        ]
+
+        super().__init__(
+            layers=layers,
+            offloading=offloading,
+            offload_only_non_sliding=offload_only_non_sliding,
+        )
+
+
+# ---------------------------------------------------------------------
+# Whisper encoder wrapper
+# ---------------------------------------------------------------------
+
+
+class WhisperEncoderExportable(torch.nn.Module):
+    """
+    Thin wrapper around Whisper's encoder so torch.export sees a simple
+    `forward(input_features) -> encoder_hidden_states`.
+    """
+
+    def __init__(self, encoder: torch.nn.Module):
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, input_features: torch.FloatTensor) -> torch.FloatTensor:
+        # Whisper encoder takes `input_features` and returns a BaseModelOutput
         return self.encoder(input_features=input_features).last_hidden_state
 
 
 # ---------------------------------------------------------------------
-# KV-cached self-attention for Whisper decoder (buffer-based KV)
+# Cross-attention projections wrapper (NEW)
 # ---------------------------------------------------------------------
 
 
-class WhisperKVCacheAttention(nn.Module):
+class WhisperCrossAttentionProjections(torch.nn.Module):
     """
-    Whisper self-attention with an internal KV cache as module buffers.
+    Compute *only* the cross-attention K/V projections for all decoder
+    layers, given encoder_hidden_states.
 
-    - Takes hidden_states (B, T, D) and input_pos (int)
-    - Uses q_proj/k_proj/v_proj/o_proj from the original Whisper self_attn module
-    - Maintains k_cache/v_cache buffers of shape (1, Hkv, T_max, D_head)
-    - Updates cache via kv_update_and_window_checked_inplace (narrow + copy_)
-    - Does scaled dot-product attention with is_causal=True
+    forward(
+        encoder_hidden_states: (B, T_enc, H)
+    ) -> (k_cache, v_cache)
+
+    where
+      k_cache: (num_layers, B, num_heads, T_enc, head_dim)
+      v_cache: (num_layers, B, num_heads, T_enc, head_dim)
     """
 
-    def __init__(
-        self,
-        attn_module: nn.Module,
-        *,
-        fallback_hidden_size: int,
-        fallback_num_heads: int,
-        fallback_num_kv_heads: int,
-        T_max: int = 4096,
-        dtype: torch.dtype = torch.float32,
-    ):
+    def __init__(self, decoder: torch.nn.Module):
         super().__init__()
-        self.q_proj = _get_attr_any(attn_module, "q_proj")
-        self.k_proj = _get_attr_any(attn_module, "k_proj")
-        self.v_proj = _get_attr_any(attn_module, "v_proj")
-        self.o_proj = _get_attr_any(attn_module, "out_proj", "o_proj", "o_proj_linear")
-        if any(x is None for x in (self.q_proj, self.k_proj, self.v_proj, self.o_proj)):
-            raise AttributeError(
-                "Whisper attention module missing q_proj/k_proj/v_proj/out_proj"
-            )
+        self.decoder = decoder
 
-        hidden_size, H, Hkv, Dh = _infer_heads_dims(
-            attn_module,
-            fallback_hidden_size,
-            fallback_num_heads,
-            fallback_num_kv_heads,
-        )
-        self.hidden_size = hidden_size
-        self.num_heads = H
-        self.num_key_value_heads = Hkv
-        self.head_dim = Dh
-        self.T_max = int(T_max)
-
-        k0 = torch.zeros(
-            (1, self.num_key_value_heads, self.T_max, self.head_dim), dtype=dtype
-        )
-        v0 = torch.zeros(
-            (1, self.num_key_value_heads, self.T_max, self.head_dim), dtype=dtype
-        )
-        self.register_buffer("k_cache", k0, persistent=False)
-        self.register_buffer("v_cache", v0, persistent=False)
-
-    def forward(self, hidden_states: torch.Tensor, input_pos: int):
-        torch._check(hidden_states.size(0) == 1)
-        B, T, _ = hidden_states.shape
-        H = self.num_heads
-        Hkv = self.num_key_value_heads
-        Dh = self.head_dim
-
-        q_lin = self.q_proj(hidden_states)
-        k_lin = self.k_proj(hidden_states)
-        v_lin = self.v_proj(hidden_states)
-
-        q_bthd = q_lin.view(B, T, H, Dh)
-        k_bthd = k_lin.view(B, T, Hkv, Dh)
-        v_bthd = v_lin.view(B, T, Hkv, Dh)
-
-        q_bhtd = q_bthd.permute(0, 2, 1, 3).contiguous().clone()
-        k_bhtd = k_bthd.permute(0, 2, 1, 3).contiguous().clone()
-        v_bhtd = v_bthd.permute(0, 2, 1, 3).contiguous().clone()
-
-        k_win, v_win = kv_update_and_window_checked_inplace(
-            self.k_cache,
-            self.v_cache,
-            k_bhtd,
-            v_bhtd,
-            input_pos,
-        )
-
-        q_ = q_bhtd
-        k_ = k_win
-        v_ = v_win
-
-        B_, Hq_, Tq_, Dh_ = q_.shape
-        _, Hkv_, Tk_, Dhk_ = k_.shape
-        assert Dh_ == Dhk_
-
-        if Hq_ != Hkv_:
-            torch._check(Hq_ >= Hkv_)
-            torch._check(Hq_ % Hkv_ == 0)
-            group = Hq_ // Hkv_
-            k_ = k_.repeat_interleave(group, dim=1)
-            v_ = v_.repeat_interleave(group, dim=1)
-
-        attn_out = F.scaled_dot_product_attention(
-            q_,
-            k_,
-            v_,
-            attn_mask=None,
-            is_causal=True,
-            scale=None,
-        )
-
-        attn_out = (
-            attn_out.permute(0, 2, 1, 3)
-            .contiguous()
-            .view(B, T, H * Dh)
-        )
-        out = self.o_proj(attn_out)
-        return out
-
-
-# ---------------------------------------------------------------------
-# Decoder with functional KV cache wired into Whisper decoder
-# ---------------------------------------------------------------------
-
-
-class WhisperDecoderWithFunctionalKV(nn.Module):
-    """
-    Forward signature:
-        forward(decoder_input_ids, encoder_hidden_states, input_pos: int)
-    """
-
-    def __init__(
-        self,
-        base: WhisperForConditionalGeneration,
-        *,
-        T_max: int = 4096,
-        dtype: torch.dtype = torch.float32,
-    ):
-        super().__init__()
-
-        self.config = base.config
-        self.decoder = base.model.decoder
-        self.proj_out = base.proj_out
-
-        cfg = self.config
-        fallback_hidden_size = int(getattr(cfg, "d_model"))
-        fallback_num_heads = int(getattr(cfg, "decoder_attention_heads"))
-        fallback_num_kv_heads = int(getattr(cfg, "decoder_attention_heads"))
-
-        for layer in self.decoder.layers:
-            layer.self_attn = WhisperKVCacheAttention(
-                layer.self_attn,
-                fallback_hidden_size=fallback_hidden_size,
-                fallback_num_heads=fallback_num_heads,
-                fallback_num_kv_heads=fallback_num_kv_heads,
-                T_max=T_max,
-                dtype=dtype,
-            )
+    @staticmethod
+    def _reshape_to_heads(
+        x: torch.Tensor,   # (B, T_enc, embed_dim)
+        seq_len: int,
+        bsz: int,
+        num_heads: int,
+        head_dim: int,
+    ) -> torch.Tensor:
+        # (B, T_enc, H*D) -> (B, T_enc, H, D) -> (B, H, T_enc, D)
+        x = x.view(bsz, seq_len, num_heads, head_dim)
+        x = x.transpose(1, 2)  # (B, H, T_enc, D)
+        return x
 
     def forward(
         self,
-        decoder_input_ids: torch.Tensor,       # [B,T_dec]
-        encoder_hidden_states: torch.Tensor,   # [B,T_enc,D]
-        input_pos: int,
+        encoder_hidden_states: torch.FloatTensor,
+    ) -> Tuple[Tuple[torch.Tensor, ...], Tuple[torch.Tensor, ...]]:
+        """
+        Returns two tuples of per-layer K/V tensors instead of stacked tensors.
+        
+        Returns:
+            (k_tuple, v_tuple) where each is a tuple of num_layers tensors,
+            each with shape (B, H, T_enc, D)
+        """
+        bsz, seq_len, _ = encoder_hidden_states.shape
+
+        k_list = []
+        v_list = []
+
+        for layer in self.decoder.layers:
+            cross_attn = layer.encoder_attn
+
+            # Linear projections: (B, T_enc, embed_dim)
+            k = cross_attn.k_proj(encoder_hidden_states)
+            v = cross_attn.v_proj(encoder_hidden_states)
+
+            num_heads = cross_attn.num_heads
+            head_dim = cross_attn.head_dim
+
+            # (B, H, T_enc, D)
+            k = self._reshape_to_heads(k, seq_len, bsz, num_heads, head_dim)
+            v = self._reshape_to_heads(v, seq_len, bsz, num_heads, head_dim)
+
+            k_list.append(k)
+            v_list.append(v)
+
+        # Return as tuples (not stacked) for easier per-layer access
+        return tuple(k_list), tuple(v_list)
+
+
+
+
+# ---------------------------------------------------------------------
+# Custom SDPA implementation (HF AttentionInterface)
+# ---------------------------------------------------------------------
+
+
+def whisper_sdpa_impl(
+    module: torch.nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor] = None,
+    dropout: float = 0.0,
+    scaling: Optional[float] = None,
+    is_causal: Optional[bool] = None,
+    **kwargs,
+):
+    """
+    Custom SDPA wrapper for Whisper that:
+
+      * Assumes `attention_mask` is already the full, precomputed mask
+        (e.g., causal + padding), sliced at the caller.
+      * Forces `is_causal=False` so sdpa does NOT add its own causal mask.
+      * Otherwise defers to the standard HF sdpa_attention_forward, so it
+        still handles things like GQA (repeat_kv) etc.
+
+    The signature matches transformers.integrations.sdpa_attention.sdpa_attention_forward
+    so it can be used with AttentionInterface.register.
+    """
+    return sdpa_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask=attention_mask,
+        dropout=dropout,
+        scaling=scaling,
+        # We always treat the mask as fully precomputed:
+        is_causal=False,
+        # Pass through any extra kwargs (output_attentions, head_mask, etc.)
+        **kwargs,
+    )
+
+
+def register_whisper_attention(model: WhisperForConditionalGeneration):
+    impl_name = "whisper_sdpa_precomputed_mask"
+    AttentionInterface.register(impl_name, whisper_sdpa_impl)
+    # Tell Whisper to use this attention implementation
+    model.config._attn_implementation = impl_name
+
+
+# ---------------------------------------------------------------------
+# Whisper decoder wrapper with static self- and cross-attn caches + mask
+# ---------------------------------------------------------------------
+
+
+class WhisperDecoderWithStaticCache(torch.nn.Module):
+    """
+    Wrapper around Whisper decoder with:
+      * A static self-attention cache implemented with WhisperCache
+        (using narrow + copy_ for updates).
+      * A static cross-attention cache implemented with WhisperCache
+        (encoder sequence length is treated as fixed).
+      * Cache tensors registered as buffers on each decoder layer:
+          self_attention_key_cache, self_attention_value_cache,
+          cross_attention_key_cache, cross_attention_value_cache.
+      * A single precomputed causal attention mask buffer on the wrapper,
+        sliced at the start of forward and passed as `attention_mask`.
+      * No DynamicCache anywhere.
+
+    forward(
+        decoder_input_ids: (B, T_dec),
+        cross_k_cache: (L, B, H, T_enc, D),
+        cross_v_cache: (L, B, H, T_enc, D),
+        cache_position: int   # symbolic int, start index for this block
+    ) -> (B, T_dec, vocab_size)
+    """
+
+    def __init__(
+        self,
+        model: WhisperForConditionalGeneration,
+        max_static_cache_length: int,
+        batch_size: int,
+        encoder_seq_len: int,
     ):
-        decoder = self.decoder
+        super().__init__()
 
-        hs = decoder.embed_tokens(decoder_input_ids)
-        if hasattr(decoder, "embed_positions"):
-            pos = decoder.embed_positions(decoder_input_ids)
-            hs = hs + pos
+        self.decoder = model.get_decoder()
+        # Whisper uses `proj_out` instead of `lm_head`
+        self.proj_out = model.proj_out
+        self.config = model.config
+        self.max_cache_len = max_static_cache_length
+        self.encoder_seq_len = encoder_seq_len
 
-        for layer in decoder.layers:
-            residual = hs
-            ln = _get_attr_any(
-                layer,
-                "self_attn_layer_norm",
-                "self_attn_layernorm",
-                default=None,
+        device = model.device
+        dtype = model.dtype
+
+        # ---- Self-attention cache (static, length = max_decoder_seq_len) ----
+        head_dim_dec = getattr(
+            self.config,
+            "head_dim",
+            self.config.d_model // self.config.decoder_attention_heads,
+        )
+        num_heads_dec = getattr(
+            self.config,
+            "num_key_value_heads",
+            self.config.decoder_attention_heads,
+        )
+
+        self.self_attention_cache = WhisperCache(
+            config=self.config,
+            max_cache_len=max_static_cache_length,
+        )
+        self.self_attention_cache.early_initialization(
+            batch_size=batch_size,
+            num_heads=num_heads_dec,
+            head_dim=head_dim_dec,
+            dtype=dtype,
+            device=device,
+        )
+
+        # ---- Cross-attention cache (static, length = encoder_seq_len) ----
+        self.cross_attention_cache = WhisperCache(
+            config=self.config,
+            max_cache_len=encoder_seq_len,
+        )
+
+        self.cross_attention_cache.early_initialization(
+            batch_size=batch_size,
+            num_heads=num_heads_dec,
+            head_dim=head_dim_dec,
+            dtype=dtype,
+            device=device,
+        )
+
+        # Combine into an EncoderDecoderCache that uses static caches for both
+        # self- and cross-attention.
+        self.cache = EncoderDecoderCache(self.self_attention_cache, self.cross_attention_cache)
+
+        # CRITICAL: Mark cross-attention cache as updated for all layers AFTER EncoderDecoderCache
+        # is created, so Whisper will use the preloaded cache instead of recomputing K/V from encoder_hidden_states.
+        # We must do this AFTER the EncoderDecoderCache.__init__() because that constructor
+        # initializes is_updated based on cache sequence length (which is 0 initially).
+        num_layers = len(self.cross_attention_cache.layers)
+        for layer_idx in range(num_layers):
+            self.cache.is_updated[layer_idx] = True
+
+        # Register cache tensors as buffers on each decoder layer
+        # (one buffer per layer for self- and cross-attn).
+        for layer_idx, layer in enumerate(self.decoder.layers):
+            self_layer = self.self_attention_cache.layers[layer_idx]
+            cross_layer = self.cross_attention_cache.layers[layer_idx]
+
+            layer.register_buffer(
+                "self_attention_key_cache",
+                self_layer.keys,
+                persistent=False,
             )
-            if ln is None:
-                raise AttributeError("Decoder layer missing self_attn_layer_norm")
-            hs = ln(hs)
-            hs = residual + layer.self_attn(hs, input_pos)
+            layer.register_buffer(
+                "self_attention_value_cache",
+                self_layer.values,
+                persistent=False,
+            )
+            layer.register_buffer(
+                "cross_attention_key_cache",
+                cross_layer.keys,
+                persistent=False,
+            )
+            layer.register_buffer(
+                "cross_attention_value_cache",
+                cross_layer.values,
+                persistent=False,
+            )
 
-            if hasattr(layer, "encoder_attn"):
-                residual = hs
-                enc_ln = _get_attr_any(
-                    layer,
-                    "encoder_attn_layer_norm",
-                    "encoder_attn_layernorm",
-                    default=None,
-                )
-                if enc_ln is None:
-                    raise AttributeError(
-                        "Decoder layer missing encoder_attn_layer_norm"
-                    )
-                hs = enc_ln(hs)
-                enc_attn_out = layer.encoder_attn(
-                    hs,
-                    encoder_hidden_states,
-                    output_attentions=False,
-                )[0]
-                hs = residual + enc_attn_out
+        # ---- Precomputed causal attention mask (for decoder self-attn) ----
+        # Shape: (1, 1, T_max, T_max)
+        min_val = torch.finfo(dtype).min
+        base = torch.full(
+            (max_static_cache_length, max_static_cache_length),
+            fill_value=min_val,
+            dtype=dtype,
+            device=device,
+        )
+        base = torch.triu(base, diagonal=1)  # 0 on/below diag, -inf above
+        causal_mask = base.view(1, 1, max_static_cache_length, max_static_cache_length)
 
-            residual = hs
-            final_ln = _get_attr_any(layer, "final_layer_norm", default=None)
-            if final_ln is None:
-                raise AttributeError("Decoder layer missing final_layer_norm")
-            hs = final_ln(hs)
-            fc1 = _get_attr_any(layer, "fc1", "dense_relu_then_dense", default=None)
-            fc2 = _get_attr_any(layer, "fc2", default=None)
-            if fc1 is None or fc2 is None:
-                raise AttributeError("Decoder layer missing fc1/fc2 MLP modules")
-            hs = fc2(F.gelu(fc1(hs)))
-            hs = residual + hs
+        self.register_buffer("decoder_causal_mask", causal_mask, persistent=False)
 
-        if hasattr(decoder, "layer_norm"):
-            hs = decoder.layer_norm(hs)
+    def _slice_causal_mask(
+            self,
+        batch_size: int,
+        seq_len: int,
+        cache_position_int: int,
+    ) -> torch.Tensor:
+        """
+        Returns a Bx1xseq_lenxT_max causal mask slice from the precomputed buffer.
 
-        logits = self.proj_out(hs)
+        We **do not** shorten the KV dimension; instead we:
+        - keep KV length = max_cache_len (static cache length),
+        - select rows corresponding to absolute positions
+            [cache_position_int, ..., cache_position_int + seq_len - 1].
+
+        This matches the static-cache behavior where K/V have length
+        `max_cache_len` at every step.
+        """
+        T_max = self.max_cache_len
+
+        # Compute row range [start, end) for this block
+        start = cache_position_int
+        end = start + seq_len
+        torch._check(end <= T_max)
+
+        # self.decoder_causal_mask: (1, 1, T_max, T_max)
+        # We take rows [start:end] and all columns [:T_max]
+        mask = self.decoder_causal_mask[:, :, start:end, :T_max]  # (1, 1, seq_len, T_max)
+
+        if batch_size != 1:
+            mask = mask.expand(batch_size, -1, -1, -1)
+
+        return mask
+
+
+    def _load_cross_kv_into_static_cache(
+        self,
+        cross_k_cache: torch.Tensor,  # (L, B, H, T_enc, D)
+        cross_v_cache: torch.Tensor,  # (L, B, H, T_enc, D)
+    ) -> None:
+        """
+        Copy the precomputed cross-attention K/V into the static
+        cross_attention_cache for all layers, using narrow + copy_.
+        """
+        num_layers = len(self.cross_attention_cache.layers)
+
+        torch._check(cross_k_cache.shape[0] == num_layers)
+        torch._check(cross_v_cache.shape[0] == num_layers)
+
+        _, B, H, T_enc, D = cross_k_cache.shape
+
+        for layer_idx, layer_cache in enumerate(self.cross_attention_cache.layers):
+            k_dst = layer_cache.keys   # (B, H, max_enc_len, D)
+            v_dst = layer_cache.values
+
+            k_src = cross_k_cache[layer_idx]  # (B, H, T_enc, D)
+            v_src = cross_v_cache[layer_idx]
+
+            torch._check(k_src.shape == (B, H, T_enc, D))
+            torch._check(v_src.shape == (B, H, T_enc, D))
+
+            # Overwrite beginning of static cross cache with the precomputed K/V
+            k_dst.narrow(2, 0, T_enc).copy_(k_src)
+            v_dst.narrow(2, 0, T_enc).copy_(v_src)
+
+    def load_cross_kv_cache(
+        self,
+        cross_k_cache: torch.Tensor,  # (L, B, H, T_enc, D)
+        cross_v_cache: torch.Tensor,  # (L, B, H, T_enc, D)
+    ) -> None:
+        """
+        Load cross-attention K/V into buffers. Call this ONCE before generation starts.
+        
+        Args:
+            cross_k_cache: (num_layers, batch, num_heads, encoder_seq_len, head_dim)
+            cross_v_cache: (num_layers, batch, num_heads, encoder_seq_len, head_dim)
+        """
+        self._load_cross_kv_into_static_cache(cross_k_cache, cross_v_cache)
+
+    def forward(
+        self,
+        decoder_input_ids: torch.LongTensor,   # (B, T_dec)
+        cache_position: torch.Tensor,          # 1D tensor containing start index
+        encoder_hidden_states: torch.FloatTensor,  # (B, T_enc, H) - for API compatibility
+    ) -> torch.FloatTensor:
+        """
+        Decoder forward pass. Cross K/V must be loaded via load_cross_kv_cache() first.
+        
+        Args:
+            decoder_input_ids: (batch, seq_len) decoder input token IDs
+            cache_position: 1D tensor with start index in self-attention cache
+            encoder_hidden_states: encoder outputs (for API compatibility)
+            
+        Returns:
+            logits: (batch, seq_len, vocab_size)
+        """
+        B, T_dec = decoder_input_ids.shape
+
+        # Self-attention cache positioning
+        torch._check(isinstance(cache_position, torch.Tensor))
+        torch._check(cache_position.numel() == 1)
+        cache_position_int = cache_position.item()
+        torch._check_is_size(cache_position_int)
+
+        attn_mask = self._slice_causal_mask(
+            batch_size=B,
+            seq_len=T_dec,
+            cache_position_int=cache_position_int,
+        )
+
+        outputs = self.decoder(
+            input_ids=decoder_input_ids,
+            encoder_hidden_states=encoder_hidden_states,
+            attention_mask=attn_mask,
+            past_key_values=self.cache,
+            use_cache=True,
+            cache_position=cache_position,
+        )
+        logits = self.proj_out(outputs[0])
         return logits
 
 
 # ---------------------------------------------------------------------
-# Export both parts (encoder + functional-KV decoder)
+# Top-level helper: export Whisper encoder + decoder (+ cross-attn proj)
 # ---------------------------------------------------------------------
 
-@torch.no_grad()
+
+def _make_example_encoder_input(
+    model: WhisperForConditionalGeneration,
+    batch_size: int,
+) -> torch.Tensor:
+    """
+    Build a dummy encoder input of the right shape using the HF processor.
+    """
+    processor = AutoProcessor.from_pretrained(model.config._name_or_path)
+    fe = processor.feature_extractor
+
+    # Whisper feature shape: (B, feature_size=80, nb_max_frames)
+    example = torch.zeros(
+        (batch_size, fe.feature_size, fe.nb_max_frames),
+        device=model.device,
+        dtype=model.dtype,
+    )
+    return example
+
+
 def export_whisper_encoder_decoder(
-    model_id: str,
+    model: WhisperForConditionalGeneration,
     *,
-    device: str = "cpu",
-    dtype: torch.dtype = torch.float32,
-    max_hidden_seq_len: int = 4096,   # unused by Whisper encoder, kept for API parity
-    max_dec_seq_len: int = 1024,      # T_max for KV cache
     batch_size: int = 1,
-    strict: bool = True,
+    max_decoder_seq_len: int = 448,
+    model_dtype: torch.dtype = torch.float32,
+    quantize: bool = False,
 ) -> Dict[str, ExportedProgram]:
     """
+    Export a Whisper encoder and decoder as three torch.export ExportedPrograms.
+
     Returns:
-      {
-        "encoder": ExportedProgram,      # (input_features) -> last_hidden_state
-        "text_decoder": ExportedProgram, # (decoder_input_ids, encoder_hidden_states, input_pos) -> logits
-      }
+        {
+            "encoder": ExportedProgram,   # forward(input_features) -> encoder_hidden_states
+            "cross_kv": ExportedProgram,  # forward(encoder_hidden_states) -> (k_cache, v_cache)
+            "decoder": ExportedProgram,   # forward(decoder_input_ids, cross_k_cache, cross_v_cache, cache_position:int) -> logits
+        }
     """
-    model = WhisperForConditionalGeneration.from_pretrained(
-        model_id,
-        dtype=dtype,
-    ).to(device).eval()
-    processor = AutoProcessor.from_pretrained(model_id)
-
-    # ------------------------------------------------------------
-    # 1) Load REAL human audio from distil-whisper/librispeech_long,
-    #    but avoid torchcodec by disabling HF audio decoding.
-    # ------------------------------------------------------------
-    dataset = load_dataset(
-        "distil-whisper/librispeech_long",
-        "clean",
-        split="validation",
-    )
-    # Prevent datasets from decoding audio via torchcodec
-    sample = dataset[0]["audio"]
-    input_features = processor(
-        sample["array"],
-        return_tensors="pt",
-        truncation=False,
-        sampling_rate=sample["sampling_rate"],
-    ).input_features
-    # Current implementation of the transcibe method accepts up to 30 seconds of audio, therefore I trim the audio here.
-    input_features_trimmed = input_features[:, :, :3000].contiguous()
-
-    # For C++: save a float32 copy to disk
-    inp_np = input_features_trimmed.numpy().astype("float32")
-    np.savetxt(
-        "whisper_encoder_input_shape.txt",
-        np.array(inp_np.shape, dtype=np.int64)[None, :],
-        fmt="%d",
-    )
-    inp_np.tofile("whisper_encoder_input.bin")  # row-major float32
-
-    # For export: use model dtype on the target device
-    input_features_export = input_features_trimmed.to(device=device, dtype=model.dtype)
-
-    # ------------------------------------------------------------
-    # 4) Export encoder
-    # ------------------------------------------------------------
-    encoder_wrapper = WhisperEncoderExportable(model).to(model.device).eval()
-    encoder_ep = torch.export.export(
-        encoder_wrapper,
-        args=(input_features_export,),
-        kwargs={},
-        dynamic_shapes=None,
-        strict=strict,
-    )
-    encoder_ep = encoder_ep.run_decompositions({})
-
-    # Compute example encoder_hidden_states using the exported module
-    encoder_hidden_states = encoder_ep.module()(input_features_export)  # [B,T_enc,D]
-
-    # ------------------------------------------------------------
-    # 5) Build decoder with functional KV
-    # ------------------------------------------------------------
-    decoder_model = WhisperDecoderWithFunctionalKV(
-        base=model,
-        T_max=max_dec_seq_len,
-        dtype=model.dtype,
-    ).to(model.device).eval()
-
-    # Quantize decoder model
     from torchao.quantization.quant_api import quantize_, IntxWeightOnlyConfig
-    from torchao.quantization.granularity import PerGroup, PerAxis
-    decoder_model = decoder_model.to(torch.bfloat16)
-    # quantize_(decoder_model, IntxWeightOnlyConfig(weight_dtype=torch.int8, granularity=PerAxis(0)), lambda m, fqn: isinstance(m, torch.nn.Embedding))
-    quantize_(decoder_model, IntxWeightOnlyConfig(weight_dtype=torch.int4, granularity=PerGroup(64)))
+    from torchao.quantization.granularity import PerGroup
+   
+   
 
-    # Example decoder inputs:
-    start_id = model.config.decoder_start_token_id or model.config.bos_token_id
-    decoder_input_ids = torch.tensor(
-        [[start_id]],
-        device=model.device,
+    model.eval()
+    device = model.device
+
+    # ---------------- Create ALL wrappers FIRST (before any quantization) ----------------
+    # This is important because they share the underlying decoder model
+    
+    # Encoder wrapper
+    encoder_input = _make_example_encoder_input(model, batch_size=batch_size).to(model_dtype)
+    encoder_wrapper = WhisperEncoderExportable(model.get_encoder()).to(device).to(model_dtype).eval()
+
+    # Get example encoder output for cross-KV projection
+    with torch.no_grad():
+        example_encoder_hidden_states = encoder_wrapper(encoder_input)
+    encoder_seq_len = example_encoder_hidden_states.shape[1]
+
+    # Cross-KV projection wrapper
+    cross_proj_wrapper = WhisperCrossAttentionProjections(
+        decoder=model.get_decoder()
+    ).to(device).to(model_dtype).eval()
+
+    # Decoder wrapper (shares the same decoder as cross_proj_wrapper)
+    start_id = getattr(model.config, "decoder_start_token_id", 0)
+    decoder_input_ids = torch.full(
+        (batch_size, 1),
+        fill_value=start_id,
         dtype=torch.long,
-    )  # [1,1]
-
-    input_pos = 3  # scalar; made symbolic via dynamic_shapes
-
-    example_inputs = (decoder_input_ids, encoder_hidden_states, input_pos)
-    print("SHAPES", decoder_input_ids.shape, encoder_hidden_states.shape)
-
-    dynamic_shapes = {
-        "decoder_input_ids": {},         # fixed shape for now
-        "encoder_hidden_states": {},     # fixed shape for now
-        "input_pos": torch.export.Dim.AUTO,
-    }
-
-    # Export decoder
-    # with torch.nn.attention.sdpa_kernel([SDPBackend.MATH]):
-    text_decoder_ep = torch.export.export(
-        decoder_model,
-        example_inputs,
-        dynamic_shapes=dynamic_shapes,
-        strict=strict,
+        device=device,
     )
-    text_decoder_ep = text_decoder_ep.run_decompositions({})
+    cache_position = torch.tensor([0], dtype=torch.int64, device=device)
+
+    decoder_wrapper = WhisperDecoderWithStaticCache(
+        model=model,
+        max_static_cache_length=max_decoder_seq_len,
+        batch_size=batch_size,
+        encoder_seq_len=encoder_seq_len,
+    ).to(device).to(model_dtype).eval()
+
+    # ---------------- Quantize wrappers (after all .to() calls) ----------------
+    # IMPORTANT: cross_proj_wrapper and decoder_wrapper share the same underlying decoder
+    # So we only quantize once through decoder_wrapper (which includes the full decoder + lm_head)
+    if quantize:
+        logger.info("Quantizing encoder and decoder wrappers...")
+        quantize_(encoder_wrapper, IntxWeightOnlyConfig(weight_dtype=torch.int4, granularity=PerGroup(64)))
+        # Skip cross_proj_wrapper since it shares decoder with decoder_wrapper
+        quantize_(decoder_wrapper, IntxWeightOnlyConfig(weight_dtype=torch.int4, granularity=PerGroup(64)))
+
+    # ---------------- Export encoder ----------------
+    logger.info(f"Exporting Whisper encoder with input_features.shape={encoder_input.shape}")
+
+    with torch.no_grad():
+        encoder_ep: ExportedProgram = torch.export.export(
+            encoder_wrapper,
+            args=(encoder_input,),
+            dynamic_shapes=None,
+            strict=True,
+        )
+        encoder_ep = encoder_ep.run_decompositions({})
+
+    # ---------------- Export cross-KV projections ----------------
+    logger.info(
+        "Exporting Whisper cross-attention projections with "
+        f"encoder_hidden_states.shape={example_encoder_hidden_states.shape}, "
+        f"encoder_seq_len={encoder_seq_len}"
+    )
+
+    with torch.no_grad():
+        example_cross_k_cache, example_cross_v_cache = cross_proj_wrapper(example_encoder_hidden_states)
+
+        cross_kv_ep: ExportedProgram = torch.export.export(
+            cross_proj_wrapper,
+            args=(example_encoder_hidden_states,),
+            dynamic_shapes=None,
+            strict=True,
+        )
+        cross_kv_ep = cross_kv_ep.run_decompositions({})
+
+    # ---------------- Export decoder ----------------
+    # Register custom HF attention implementation
+    register_whisper_attention(model)
+
+    logger.info(
+        "Exporting Whisper decoder with "
+        f"decoder_input_ids.shape={decoder_input_ids.shape}, "
+        f"encoder_seq_len={encoder_seq_len}, "
+        f"cross_k_tuple: {len(example_cross_k_cache)} tensors, first shape={example_cross_k_cache[0].shape}, "
+        f"cache_position={cache_position}"
+    )
+
+    with torch.nn.attention.sdpa_kernel([SDPBackend.MATH]), torch.no_grad():
+        decoder_ep: ExportedProgram = torch.export.export(
+            decoder_wrapper,
+            args=(decoder_input_ids, cache_position, example_encoder_hidden_states),
+            dynamic_shapes=None,
+            strict=True,
+        )
+        decoder_ep = decoder_ep.run_decompositions({})
 
     return {
         "encoder": encoder_ep,
-        "text_decoder": text_decoder_ep,
+        "cross_kv": cross_kv_ep,
+        "decoder": decoder_ep,
     }
 
 
+
 # ---------------------------------------------------------------------
-# Tiny CLI helper
+# Tiny example usage (optional)
 # ---------------------------------------------------------------------
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    model_id = "openai/whisper-large-v3-turbo"
-    eps = export_whisper_encoder_decoder(
-        model_id=model_id,
-        device="cpu",
-        dtype=torch.bfloat16,
-        max_dec_seq_len=1024,
-        batch_size=1,
-        strict=False,
-    )
-    print("Exported:", list(eps.keys()))
-    for name, ep in eps.items():
-        print("=== ", name, " ===")
-        print(ep)
 
+    model_id = "openai/whisper-large-v3-turbo"
+    model = WhisperForConditionalGeneration.from_pretrained(
+        model_id,
+    ).to("cuda" if torch.cuda.is_available() else "cpu")
+
+    eps = export_whisper_encoder_decoder(
+        model,
+        **DEFAULT_EXPORT_KWARGS
+    )
+
+    encoder_ep = eps["encoder"]
+    cross_kv_ep = eps["cross_kv"]
+    decoder_ep = eps["decoder"]
+
+    print("Encoder graph:", encoder_ep)
+    print("Cross-KV graph:", cross_kv_ep)
+    print("Decoder graph:", decoder_ep)
+
+
+    from program_builder import ProgramBuilder
     for k in eps:
         P = ProgramBuilder(eps[k])
         prog_json = P.build()

@@ -38,6 +38,30 @@ struct LinearNode {
   std::optional<Tid> bias { std::nullopt };
 };
 
+struct ItemIntNode {
+  Tid x { Tid{} };
+  Vid<int> out { Vid<int>{} };
+};
+
+struct ExpandDimsNode {
+  Tid x { Tid{} };
+  Tid out { Tid{} };
+  int axis {};
+};
+
+struct TileNode {
+  Tid x { Tid{} };
+  Tid out { Tid{} };
+  std::vector<int> reps {};
+};
+
+struct TakeAlongAxisNode {
+  Tid x { Tid{} };
+  Tid indices { Tid{} };
+  Tid out { Tid{} };
+  int axis {};
+};
+
 struct RMSNormNode {
   Tid x { Tid{} };
   Tid weight { Tid{} };
@@ -242,6 +266,10 @@ struct QuantizedGatherNode {
 #define OP_LIST(X) \
   X(NOOP, NoopNode) \
   X(LINEAR, LinearNode) \
+  X(ITEM_INT, ItemIntNode) \
+  X(EXPAND_DIMS, ExpandDimsNode) \
+  X(TILE, TileNode) \
+  X(TAKE_ALONG_AXIS, TakeAlongAxisNode) \
   X(RMS_NORM, RMSNormNode) \
   X(LAYER_NORM, LayerNormNode) \
   X(ROPE_APPLY, RopeNode) \
@@ -291,6 +319,10 @@ using OpPayloadT = typename OpPayload<OC>::type;
 using NodeVariant = std::variant<
   NoopNode,
   LinearNode,
+  ItemIntNode,
+  ExpandDimsNode,
+  TileNode,
+  TakeAlongAxisNode,
   RMSNormNode,
   LayerNormNode,
   RopeNode,
@@ -324,6 +356,10 @@ using NodeVariant = std::variant<
 enum : size_t {
   VAR_IDX_NOOP,
   VAR_IDX_LINEAR,
+  VAR_IDX_ITEM_INT,
+  VAR_IDX_EXPAND_DIMS,
+  VAR_IDX_TILE,
+  VAR_IDX_TAKE_ALONG_AXIS,
   VAR_IDX_RMS_NORM,
   VAR_IDX_LAYER_NORM,
   VAR_IDX_ROPE_APPLY,
@@ -357,6 +393,10 @@ enum : size_t {
 template <OpCode> struct OpVariantIndex;
 template <> struct OpVariantIndex<OpCode::NOOP> { static constexpr size_t value = VAR_IDX_NOOP; };
 template <> struct OpVariantIndex<OpCode::LINEAR> { static constexpr size_t value = VAR_IDX_LINEAR; };
+template <> struct OpVariantIndex<OpCode::ITEM_INT> { static constexpr size_t value = VAR_IDX_ITEM_INT; };
+template <> struct OpVariantIndex<OpCode::EXPAND_DIMS> { static constexpr size_t value = VAR_IDX_EXPAND_DIMS; };
+template <> struct OpVariantIndex<OpCode::TILE> { static constexpr size_t value = VAR_IDX_TILE; };
+template <> struct OpVariantIndex<OpCode::TAKE_ALONG_AXIS> { static constexpr size_t value = VAR_IDX_TAKE_ALONG_AXIS; };
 template <> struct OpVariantIndex<OpCode::RMS_NORM> { static constexpr size_t value = VAR_IDX_RMS_NORM; };
 template <> struct OpVariantIndex<OpCode::LAYER_NORM> { static constexpr size_t value = VAR_IDX_LAYER_NORM; };
 template <> struct OpVariantIndex<OpCode::ROPE_APPLY> { static constexpr size_t value = VAR_IDX_ROPE_APPLY; };
